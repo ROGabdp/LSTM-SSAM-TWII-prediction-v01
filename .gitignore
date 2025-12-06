@@ -1,0 +1,12 @@
+
+# Python
+__pycache__/
+*.pyc
+
+# Artifacts
+saved_models/
+*.png
+
+# IDE
+.vscode/
+.idea/
