@@ -647,7 +647,7 @@ def predict_mode(args):
     print("=" * 50)
     
     # 顯示逐日預測（如果步數不多）
-    if trading_days <= 10:
+    if trading_days <= 60:
         print("\n📊 逐日預測明細：")
         print("-" * 40)
         prev_price = current_price
