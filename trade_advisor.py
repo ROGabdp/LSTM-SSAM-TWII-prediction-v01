@@ -13,7 +13,7 @@ TWII 投資顧問機器人 (Trade Advisor)
 
 輸入來源：
   - 短期訊號 (T+1): saved_models_multivariate/
-  - 波段趨勢 (T+5): saved_models_optimized/
+  - 波段趨勢 (T+5): saved_models_5d/
 """
 
 import json
@@ -37,7 +37,7 @@ BASE_DIR = Path(__file__).parent
 
 # 模型目錄
 MODELS_DIR_1D = BASE_DIR / "saved_models_multivariate"  # T+1 短期模型
-MODELS_DIR_5D = BASE_DIR / "saved_models_optimized"     # T+5 波段模型
+MODELS_DIR_5D = BASE_DIR / "saved_models_5d"            # T+5 波段模型
 
 # 模型篩選條件
 MIN_TRAIN_DAYS = 1460  # 最低訓練天數（4 年）
@@ -235,27 +235,31 @@ def load_model_artifacts(model_dir: Path, metadata: Dict[str, Any]) -> Tuple:
     """
     載入模型及相關資源
     
+    支援兩種 Scaler 命名格式：
+    - 格式 A：feature_scaler_YYYY-MM-DD_YYYY-MM-DD.pkl（新格式）
+    - 格式 B：scaler_YYYY-MM-DD_YYYY-MM-DD.pkl（舊版相容）
+    
     Returns:
         (model, feature_scaler, target_scaler, metadata)
     """
     train_start = metadata['train_start']
     train_end = metadata['train_end']
     
-    # 構建檔案路徑
+    # 構建模型檔案路徑
     model_path = model_dir / f"model_{train_start}_{train_end}.keras"
     
-    # 嘗試兩種可能的縮放器命名格式
-    # 格式 1：feature_scaler_*.pkl（optimized 目錄）
-    # 格式 2：scaler_*.pkl（multivariate 目錄，舊格式）
+    # 嘗試新格式的縮放器路徑
     feature_scaler_path = model_dir / f"feature_scaler_{train_start}_{train_end}.pkl"
     target_scaler_path = model_dir / f"target_scaler_{train_start}_{train_end}.pkl"
     
-    # 如果新格式不存在，嘗試舊格式（multivariate 目錄可能使用）
+    # 如果新格式不存在，嘗試舊格式（scaler_*.pkl）
     if not feature_scaler_path.exists():
-        # multivariate 目錄的格式
-        feature_scaler_path = model_dir / f"feature_scaler_{train_start}_{train_end}.pkl"
-    if not target_scaler_path.exists():
-        target_scaler_path = model_dir / f"target_scaler_{train_start}_{train_end}.pkl"
+        legacy_scaler_path = model_dir / f"scaler_{train_start}_{train_end}.pkl"
+        if legacy_scaler_path.exists():
+            # 舊格式只有一個檔案，同時作為 feature 和 target scaler
+            feature_scaler_path = legacy_scaler_path
+            target_scaler_path = legacy_scaler_path
+            print(f"  [注意] 使用舊版 Scaler 格式：{legacy_scaler_path.name}")
     
     # 載入模型
     model = keras.models.load_model(
@@ -447,7 +451,7 @@ def main():
     
     if metadata_5d is None:
         print("\n❌ 無法載入 T+5 模型，程式終止。")
-        print("   請先執行：python twii_model_optimizer.py train")
+        print("   請先執行：python twii_model_registry_5d.py train ...")
         return
     
     # 取得 lookback 參數

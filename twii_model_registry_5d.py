@@ -46,9 +46,10 @@ from tensorflow.keras import layers, Model
 MODELS_DIR = Path(__file__).parent / "saved_models_5d"  # 5 日預測專用目錄
 LOOKBACK = 30  # 回看天數（增加以捕捉更長趨勢）
 FORECAST_HORIZON = 5  # 預測未來第 5 個交易日
-LSTM_UNITS = 50
+LSTM_UNITS = 256
+DROPOUT_RATE = 0.05  # Dropout 比率（防止過擬合）
 EPOCHS = 50
-BATCH_SIZE = 10
+BATCH_SIZE = 12
 TRAIN_RATIO = 0.9
 MODEL_STALE_DAYS = 180  # 模型過期警告閾值（天）
 MIN_TRAIN_DAYS = 1460   # 最低訓練天數（4 年 = 4 × 365 = 1460 天）
@@ -190,21 +191,38 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 # 模型架構
 # =============================================================================
-def build_lstm_ssam_model(time_steps: int = LOOKBACK, n_features: int = 5, lstm_units: int = LSTM_UNITS):
+def build_lstm_ssam_model(
+    time_steps: int = LOOKBACK, 
+    n_features: int = 5, 
+    lstm_units: int = LSTM_UNITS,
+    dropout_rate: float = DROPOUT_RATE
+):
     """
-    建立 LSTM + Self-Attention 混合模型（5 日預測版本）
+    建立 LSTM + Dropout + Self-Attention 混合模型（5 日預測版本）
+    
+    架構：Input -> LSTM -> Dropout -> Self-Attention -> Flatten -> Dense(1)
     
     Args:
         time_steps: 回看天數（預設 30）
         n_features: 輸入特徵數量（預設 5）
         lstm_units: LSTM 隱藏層單元數
+        dropout_rate: Dropout 比率（防止過擬合）
     
     Returns:
         編譯好的 Keras 模型
     """
     inputs = layers.Input(shape=(time_steps, n_features), name='input_layer')
+    
+    # LSTM 層
     lstm_out = layers.LSTM(units=lstm_units, return_sequences=True, name='lstm_layer')(inputs)
-    attention_out = SelfAttention(name='self_attention')(lstm_out)
+    
+    # Dropout 層（防止過擬合）
+    dropout_out = layers.Dropout(rate=dropout_rate, name='dropout_layer')(lstm_out)
+    
+    # Self-Attention 層
+    attention_out = SelfAttention(name='self_attention')(dropout_out)
+    
+    # 輸出層
     flatten_out = layers.Flatten(name='flatten_layer')(attention_out)
     outputs = layers.Dense(units=1, activation='linear', name='output_layer')(flatten_out)
     
@@ -455,6 +473,9 @@ def save_artifacts(
         "feature_columns": get_feature_columns(),
         "price_min": price_min,
         "price_max": price_max,
+        "dropout_rate": DROPOUT_RATE,
+        "lstm_units": LSTM_UNITS,
+        "batch_size": BATCH_SIZE,
         "training_timestamp": datetime.now().isoformat(),
         "technical_indicators": {
             "kd_params": list(KD_PARAMS),
