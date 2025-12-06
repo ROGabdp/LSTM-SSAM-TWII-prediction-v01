@@ -1,120 +1,110 @@
-# TWII 台股大盤預測系統
+# TWII 台股大盤預測與投資顧問系統
 
-基於 **LSTM + Self-Attention (SSAM)** 架構的台股加權指數預測模型，具備完整的模型版本管理與自動選擇功能。
+本專案是一個整合多種 AI 模型的台股加權指數 (TWII) 預測系統，結合了 **LSTM**, **Self-Attention (SSAM)**, **Dropout** 等深度學習技術，並包含一個智慧投資顧問機器人，提供定期定額的資金控管建議。
 
-## ✨ 功能特色
+## ✨ 主要功能
 
-- 🧠 **LSTM-SSAM 架構**：結合長短期記憶網路與自注意力機制
-- 📦 **模型註冊系統**：自動管理多版本模型，智慧選擇最佳版本
-- 🔮 **多步遞迴預測**：支援預測未來多個交易日
-- 📊 **效能指標追蹤**：自動記錄 R² Score 和 RMSE
-- 📈 **視覺化輸出**：訓練完成後自動生成預測結果圖表
+- **� 多樣化預測模型**：
+    - **T+1 短期模型** (`twii_model_registry_multivariate.py`)：預測隔日收盤價，精準捕捉短期波動。
+    - **T+5 波段模型** (`twii_model_registry_5d.py`)：預測未來第 5 個交易日價格，用於判斷中期趨勢。
+    - **模型優化器** (`twii_model_optimizer.py`)：自動化 Grid Search，尋找最佳超參數。
+- **🤖 智慧投資顧問** (`trade_advisor.py`)：
+    - 整合長短期模型訊號。
+    - **信心度評估**：結合 MC Dropout (風險波動) 與 RMSE 區間判斷。
+    - **動態建議**：提供「進場時機」與「資金控管」雙重建議。
+- **📊 完整技術指標**：整合 KD, MACD, 成交量 (Log) 等多變量特徵。
+- **🛡️ 嚴謹的模型管理**：防止資料洩漏 (Data Leakage)，自動過濾過期模型。
 
-## 📁 專案結構
+## 📁 檔案說明
+
+### 1. 🤖 投資顧問機器人 (`trade_advisor.py`)
+這是系統的核心使用者介面，整合所有模型的預測結果。
+
+- **功能**：
+    - 自動掃描並載入最佳的 T+1 與 T+5 模型。
+    - 執行 **MC Dropout** (30次迭代) 計算 T+5 預測的不確定性 (Confidence)。
+    - 結合 **RMSE** 評估 T+1 預測的信心度。
+    - 根據「趨勢共振」邏輯，動態調整信心評級。
+- **使用方式**：
+    ```bash
+    python trade_advisor.py
+    ```
+- **輸出範例**：
+    > 🎯 綜合建議：市場短期看漲、中期樂觀，建議「加碼進場」
+
+### 2. 📉 T+5 波段預測模型 (`twii_model_registry_5d.py`)
+專為波段交易設計的模型，直接預測 5 天後的價格 (Direct Strategy)。
+
+- **特色**：
+    - **Dropout 機制**：防止過擬合，並支援 MC Dropout 不確定性估計。
+    - **Direct Strategy**：直接映射 $X_t \to y_{t+5}$，避免遞迴累積誤差。
+- **使用方式**：
+    ```bash
+    # 訓練 (自動存入 saved_models_5d/)
+    python twii_model_registry_5d.py train --start 2020-01-01 --end 2025-12-05
+    
+    # 預測
+    python twii_model_registry_5d.py predict
+    ```
+
+### 3. ⏱️ T+1 短期預測模型 (`twii_model_registry_multivariate.py`)
+用於捕捉隔日行情的短期模型。
+
+- **特色**：
+    - **多變量輸入**：整合 OHLCV + KD + MACD。
+    - **精細縮放**：特徵與目標使用獨立的 Scaler。
+- **使用方式**：
+    ```bash
+    # 訓練 (自動存入 saved_models_multivariate/)
+    python twii_model_registry_multivariate.py train --start 2020-07-01 --end 2025-12-05
+    
+    # 預測
+    python twii_model_registry_multivariate.py predict
+    ```
+
+### 4. ⚡ 模型優化器 (`twii_model_optimizer.py`)
+用於 T+5 模型的超參數自動搜尋。
+
+- **功能**：
+    - 支援 Grid Search (LSTM Units, Dropout Rate, Batch Size等)。
+    - Time Series Cross-Validation 驗證。
+    - 自動保存最佳參數至 `saved_models_optimized/best_params.json`。
+- **使用方式**：
+    ```bash
+    # 開始搜尋最佳參數
+    python twii_model_optimizer.py optimize
+    
+    # 使用最佳參數進行全量訓練
+    python twii_model_optimizer.py train
+    ```
+
+## 📂 目錄結構
 
 ```
 LSTM-SSAM-TWII-prediction-v01/
-├── twii_model_registry.py      # 主程式（模型註冊系統）
-├── twii_lstm_ssam_predict.py   # 基礎版本（單次訓練/預測）
-├── saved_models/               # 模型倉庫
-│   ├── model_*.keras           # Keras 模型檔
-│   ├── scaler_*.pkl            # MinMaxScaler 縮放器
-│   ├── meta_*.json             # 元資料（含效能指標）
-│   └── plot_*.png              # 訓練結果視覺化圖表
-└── README.md
+├── trade_advisor.py                    # [核心] 投資顧問機器人
+├── twii_model_registry_5d.py           # [核心] T+5 模型訓練/預測
+├── twii_model_registry_multivariate.py # [核心] T+1 模型訓練/預測
+├── twii_model_optimizer.py             # [工具] 超參數優化
+├── saved_models_5d/                    # T+5 模型存檔
+├── saved_models_multivariate/          # T+1 模型存檔
+└── saved_models_optimized/             # 優化後的模型存檔
 ```
 
-## 🚀 快速開始
+## ⚙️ 系統需求
 
-### 安裝依賴
+- Python 3.8+
+- TensorFlow 2.x
+- Pandas, NumPy, Scikit-learn, Yfinance, Matplotlib
 
 ```bash
-pip install numpy pandas matplotlib yfinance scikit-learn tensorflow
+pip install tensorflow pandas numpy scikit-learn yfinance matplotlib
 ```
 
-### 訓練模型
+## 📝 備註
 
-```bash
-python twii_model_registry.py train --start 2020-01-01 --end 2025-12-05
-```
+本系統參考論文架構：*Sequential Self-Attention Model for Stock Price Prediction*，並針對台股特性進行了在地化調整與功能擴充。
 
-訓練完成後會在 `saved_models/` 目錄產生：
-- `model_{start}_{end}.keras` - 訓練好的模型
-- `scaler_{start}_{end}.pkl` - 資料縮放器
-- `meta_{start}_{end}.json` - 元資料（含 R²、RMSE）
-- `plot_{start}_{end}.png` - 預測結果視覺化
-
-### 預測價格
-
-```bash
-# 預測明天
-python twii_model_registry.py predict
-
-# 預測指定日期
-python twii_model_registry.py predict --target_date 2025-12-15
-```
-
-輸出範例：
-```
-[搜尋] 找到 6 個可用模型：
-  1. model_2021-01-01_2025-12-05 (R²: 0.9682) -> Selected (Best Match)
-  2. model_2017-01-01_2025-12-05 (R²: 0.9532) -> Backup (Lower R²)
-
-==================================================
-🔮 TWII 預測結果 - 目標日期：2025-12-08
-==================================================
-  最近收盤價 (2025-12-05) : 27980.89
-  預測價格   (2025-12-08) : 27634.40
-  預期變化   : -346.49 (-1.24%)
-  趨勢判斷   : 📉 看跌
-==================================================
-```
-
-## 🧮 模型選擇邏輯
-
-系統會自動選擇最適合的模型，排序優先順序：
-
-1. **Recency（時效性）**：`train_end` 越新越好
-2. **Performance（效能）**：R² Score 越高越好
-3. **Freshness（專精度）**：`train_start` 越新，模型越專精於近期市場
-
-### 過濾條件
-- ✅ 訓練天數 ≥ 1460 天（4 年）
-- ✅ `train_end` < 目標預測日期（避免資料洩漏）
-
-## ⚙️ 設定參數
-
-| 參數 | 預設值 | 說明 |
-|------|--------|------|
-| `LOOKBACK` | 10 | 回看天數（時間步長） |
-| `LSTM_UNITS` | 50 | LSTM 隱藏單元數 |
-| `EPOCHS` | 50 | 訓練輪數 |
-| `BATCH_SIZE` | 10 | 批次大小 |
-| `MIN_TRAIN_DAYS` | 1460 | 最低訓練天數（4 年） |
-| `MODEL_STALE_DAYS` | 180 | 模型過期警告閾值 |
-
-## 📊 元資料格式
-
-```json
-{
-  "train_start": "2021-01-01",
-  "train_end": "2025-12-05",
-  "lookback": 10,
-  "price_min": 15159.86,
-  "price_max": 24416.67,
-  "training_timestamp": "2025-12-06T11:45:00",
-  "metrics": {
-    "rmse": 430.40,
-    "r2": 0.9682
-  }
-}
-```
-
-## 📝 參考論文
-
-本專案架構參考自論文：
-> Sequential Self-Attention Model for Stock Price Prediction
-
-## 📜 授權
+## 📜 License
 
 MIT License

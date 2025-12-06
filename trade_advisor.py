@@ -6,7 +6,8 @@ TWII 投資顧問機器人 (Trade Advisor)
 功能：
 - 智慧模型選擇：自動掃描並選擇最佳的 1日/5日 預測模型
 - 雙模型推論：同時取得短期(T+1)與波段(T+5)預測
-- 投資建議產生：根據預測漲幅提供資金控管與進場時機建議
+- 信心度評估：MC Dropout (5日) + RMSE 區間判斷 (1日)
+- 投資建議產生：根據預測漲幅與信心度提供資金控管與進場時機建議
 
 使用方式：
   python trade_advisor.py
@@ -49,6 +50,13 @@ MACD_PARAMS = (12, 26, 9)
 # 投資建議閾值
 TREND_BULLISH_THRESHOLD = 0.02    # 5日漲幅 > 2% 為大晴天
 TREND_BEARISH_THRESHOLD = -0.02   # 5日漲幅 < -2% 為暴風雨
+
+# MC Dropout 設定
+MC_DROPOUT_ITERATIONS = 30        # MC Dropout 預測迭代次數
+
+# 信心度閾值
+CV_HIGH_CONFIDENCE = 0.005        # CV < 0.5% 為高信心度
+CV_LOW_CONFIDENCE = 0.01          # CV > 1% 為低信心度
 
 
 # =============================================================================
@@ -160,12 +168,6 @@ def select_best_model(model_dir: Path) -> Optional[Dict[str, Any]]:
     1. 訓練期間過濾：train_end - train_start >= 1460 天 (4年)
     2. 避免未來數據：train_end <= today
     3. 排序（降冪）：train_end -> r2 -> train_start
-    
-    Args:
-        model_dir: 模型目錄路徑
-    
-    Returns:
-        最佳模型的 metadata，如果找不到則返回 None
     """
     if not model_dir.exists():
         print(f"[錯誤] 模型目錄不存在：{model_dir}")
@@ -187,18 +189,14 @@ def select_best_model(model_dir: Path) -> Optional[Dict[str, Any]]:
             train_start = datetime.strptime(metadata['train_start'], '%Y-%m-%d').date()
             train_end = datetime.strptime(metadata['train_end'], '%Y-%m-%d').date()
             
-            # 計算訓練天數
             duration_days = (train_end - train_start).days
             
-            # 篩選條件 1：訓練期間必須至少 4 年
             if duration_days < MIN_TRAIN_DAYS:
                 continue
             
-            # 篩選條件 2：避免未來數據（train_end <= today）
             if train_end > today:
                 continue
             
-            # 取得 R² 分數
             r2 = metadata.get('metrics', {}).get('r2', 0.0) or 0.0
             
             candidates.append({
@@ -218,13 +216,11 @@ def select_best_model(model_dir: Path) -> Optional[Dict[str, Any]]:
         print(f"[錯誤] 在 {model_dir} 找不到符合條件的模型（訓練 >= 4 年）")
         return None
     
-    # 排序邏輯（降冪）：train_end -> r2 -> train_start
     candidates.sort(
         key=lambda x: (x['train_end'], x['r2'], x['train_start']),
         reverse=True
     )
     
-    # 返回最佳模型
     return candidates[0]['metadata']
 
 
@@ -245,29 +241,23 @@ def load_model_artifacts(model_dir: Path, metadata: Dict[str, Any]) -> Tuple:
     train_start = metadata['train_start']
     train_end = metadata['train_end']
     
-    # 構建模型檔案路徑
     model_path = model_dir / f"model_{train_start}_{train_end}.keras"
     
-    # 嘗試新格式的縮放器路徑
     feature_scaler_path = model_dir / f"feature_scaler_{train_start}_{train_end}.pkl"
     target_scaler_path = model_dir / f"target_scaler_{train_start}_{train_end}.pkl"
     
-    # 如果新格式不存在，嘗試舊格式（scaler_*.pkl）
     if not feature_scaler_path.exists():
         legacy_scaler_path = model_dir / f"scaler_{train_start}_{train_end}.pkl"
         if legacy_scaler_path.exists():
-            # 舊格式只有一個檔案，同時作為 feature 和 target scaler
             feature_scaler_path = legacy_scaler_path
             target_scaler_path = legacy_scaler_path
             print(f"  [注意] 使用舊版 Scaler 格式：{legacy_scaler_path.name}")
     
-    # 載入模型
     model = keras.models.load_model(
         model_path,
         custom_objects={'SelfAttention': SelfAttention}
     )
     
-    # 載入縮放器
     with open(feature_scaler_path, 'rb') as f:
         feature_scaler = pickle.load(f)
     
@@ -281,11 +271,7 @@ def load_model_artifacts(model_dir: Path, metadata: Dict[str, Any]) -> Tuple:
 # 資料獲取
 # =============================================================================
 def download_market_data(lookback_1d: int, lookback_5d: int) -> pd.DataFrame:
-    """
-    下載市場資料
-    
-    下載長度：max(lookback_1d, lookback_5d) + 50 天（確保技術指標暖機）
-    """
+    """下載市場資料"""
     required_days = max(lookback_1d, lookback_5d) + 50
     
     print(f"[資料獲取] 正在下載 ^TWII 最近 {required_days} 天資料...")
@@ -302,8 +288,165 @@ def download_market_data(lookback_1d: int, lookback_5d: int) -> pd.DataFrame:
 
 
 # =============================================================================
-# 模型推論
+# MC Dropout 不確定性評估（針對 5 日模型）
 # =============================================================================
+def predict_with_uncertainty(
+    model,
+    X: np.ndarray,
+    target_scaler: MinMaxScaler,
+    n_iter: int = MC_DROPOUT_ITERATIONS
+) -> Tuple[float, float, str]:
+    """
+    使用 MC Dropout 進行不確定性評估
+    
+    原理：
+    - 強制開啟 Dropout 模式（training=True），重複預測 n_iter 次
+    - 計算預測結果的平均值作為最終預測，標準差作為不確定性
+    
+    Args:
+        model: Keras 模型（必須包含 Dropout 層）
+        X: 輸入特徵 (shape: 1, lookback, n_features)
+        target_scaler: 目標變數縮放器
+        n_iter: MC Dropout 迭代次數
+    
+    Returns:
+        (mean_price, std_price, confidence_level)
+        - mean_price: 預測價格平均值
+        - std_price: 預測價格標準差（風險波動）
+        - confidence_level: 信心度等級 ('高', '中', '低')
+    """
+    predictions = []
+    
+    for _ in range(n_iter):
+        # 強制開啟 Dropout 模式
+        y_pred_scaled = model(X, training=True)
+        y_pred = target_scaler.inverse_transform(y_pred_scaled.numpy())[0, 0]
+        predictions.append(y_pred)
+    
+    predictions = np.array(predictions)
+    
+    # 計算統計量
+    mean_price = np.mean(predictions)
+    std_price = np.std(predictions)
+    
+    # 計算變異係數 (CV = Std / Mean)
+    cv = std_price / mean_price if mean_price != 0 else 0
+    
+    # 判斷信心度
+    if cv < CV_HIGH_CONFIDENCE:
+        confidence_level = "高"
+    elif cv > CV_LOW_CONFIDENCE:
+        confidence_level = "低"
+    else:
+        confidence_level = "中"
+    
+    return mean_price, std_price, confidence_level
+
+
+# =============================================================================
+# RMSE 區間信心度評估（針對 1 日模型）- 寬鬆門檻版本
+# =============================================================================
+def evaluate_1d_confidence(
+    pred_price: float,
+    current_price: float,
+    rmse: float
+) -> str:
+    """
+    根據 RMSE 評估 1 日模型的信心度（寬鬆門檻）
+    
+    邏輯（寬鬆版）：
+    - 預期獲利點數 = abs(預測價 - 現價)
+    - 若 預期獲利 > 0.8 * RMSE -> 信心度：高
+    - 若 預期獲利 > 0.4 * RMSE -> 信心度：中
+    - 若 預期獲利 < 0.4 * RMSE -> 信心度：低（可能只是雜訊）
+    
+    Args:
+        pred_price: 預測價格
+        current_price: 當前價格
+        rmse: 模型 RMSE
+    
+    Returns:
+        confidence_level: 信心度等級 ('高', '中', '低')
+    """
+    expected_profit = abs(pred_price - current_price)
+    
+    # 寬鬆門檻：0.8x 和 0.4x RMSE
+    if expected_profit > 0.8 * rmse:
+        return "高"
+    elif expected_profit > 0.4 * rmse:
+        return "中"
+    else:
+        return "低"
+
+
+# =============================================================================
+# 趨勢共振 (Trend Alignment) 加分機制
+# =============================================================================
+def apply_trend_alignment(
+    confidence_1d: str,
+    change_5d: float,
+    confidence_5d: str
+) -> tuple:
+    """
+    根據 T+5 趨勢對 T+1 信心度進行加分調整
+    
+    邏輯：
+    - 若 T+5 看漲 (change > 0) 且信心度為高/中：
+      → T+1 信心度升一級（低→中，中→高）
+    - 若 T+5 看跌：
+      → T+1 維持原判（逆勢需高標準）
+    
+    Args:
+        confidence_1d: 原始 T+1 信心度
+        change_5d: T+5 預期漲跌幅
+        confidence_5d: T+5 信心度
+    
+    Returns:
+        (adjusted_confidence, upgraded): 調整後信心度, 是否有升級
+    """
+    # 檢查是否符合順勢加分條件
+    is_t5_bullish = change_5d > 0
+    is_t5_confident = confidence_5d in ["高", "中"]
+    
+    if is_t5_bullish and is_t5_confident:
+        # 順勢交易，信心度升一級
+        if confidence_1d == "低":
+            return "中", True
+        elif confidence_1d == "中":
+            return "高", True
+        else:
+            return "高", False  # 已經是高，不變
+    else:
+        # 逆勢或 T+5 信心不足，維持原判
+        return confidence_1d, False
+
+
+# =============================================================================
+# 模型推論（標準版）
+# =============================================================================
+def prepare_input_data(
+    df_processed: pd.DataFrame,
+    feature_scaler: MinMaxScaler,
+    lookback: int
+) -> np.ndarray:
+    """準備模型輸入資料"""
+    feature_columns = get_feature_columns()
+    
+    if 'Adj Close' not in df_processed.columns:
+        df_processed = df_processed.copy()
+        df_processed['Adj Close'] = df_processed['Close']
+    
+    features = df_processed[feature_columns].values
+    scaled_features = feature_scaler.transform(features)
+    
+    if len(scaled_features) < lookback:
+        raise ValueError(f"資料不足，需要至少 {lookback} 筆")
+    
+    X = scaled_features[-lookback:].reshape(1, lookback, len(feature_columns))
+    
+    return X
+
+
 def run_inference(
     model,
     feature_scaler: MinMaxScaler,
@@ -311,67 +454,43 @@ def run_inference(
     df_processed: pd.DataFrame,
     lookback: int
 ) -> float:
-    """
-    執行模型推論
-    
-    Args:
-        model: Keras 模型
-        feature_scaler: 特徵縮放器
-        target_scaler: 目標縮放器
-        df_processed: 已處理的資料（含技術指標）
-        lookback: 回看天數
-    
-    Returns:
-        預測價格（真實價格，非縮放後）
-    """
-    feature_columns = get_feature_columns()
-    
-    # 確保有 Adj Close 欄位
-    if 'Adj Close' not in df_processed.columns:
-        df_processed = df_processed.copy()
-        df_processed['Adj Close'] = df_processed['Close']
-    
-    # 取得特徵
-    features = df_processed[feature_columns].values
-    
-    # 縮放特徵
-    scaled_features = feature_scaler.transform(features)
-    
-    # 確保資料量足夠
-    if len(scaled_features) < lookback:
-        raise ValueError(f"資料不足，需要至少 {lookback} 筆")
-    
-    # 取最後 lookback 筆
-    X = scaled_features[-lookback:].reshape(1, lookback, len(feature_columns))
-    
-    # 預測
+    """執行標準模型推論"""
+    X = prepare_input_data(df_processed, feature_scaler, lookback)
     y_pred_scaled = model.predict(X, verbose=0)
-    
-    # 還原為真實價格
     predicted_price = target_scaler.inverse_transform(y_pred_scaled)[0, 0]
     
     return predicted_price
 
 
 # =============================================================================
-# 投資建議產生
+# 投資建議產生（含信心度考量）
 # =============================================================================
-def generate_advice(change_1d: float, change_5d: float) -> Dict[str, str]:
+def generate_advice(
+    change_1d: float,
+    change_5d: float,
+    confidence_1d: str,
+    confidence_5d: str
+) -> Dict[str, str]:
     """
-    根據預測漲幅產生投資建議
+    根據預測漲幅與信心度產生投資建議
     
-    Args:
-        change_1d: T+1 預期漲幅（例如 0.01 = 1%）
-        change_5d: T+5 預期漲幅
-    
-    Returns:
-        包含 trend_advice 和 timing_advice 的字典
+    信心度調整邏輯：
+    - 5日策略：大晴天 + 低信心度 -> 降級為維持標準扣款
+    - 1日策略：綠燈 + 低信心度 -> 降級為觀望
     """
-    # 資金控管建議（5日模型）
+    # ==========================================================================
+    # 資金控管建議（5日模型 + 信心度調整）
+    # ==========================================================================
     if change_5d > TREND_BULLISH_THRESHOLD:
-        trend_emoji = "🌞"
-        trend_status = "大晴天"
-        trend_advice = "市場樂觀，建議加碼扣款 1.5~2 倍"
+        if confidence_5d == "低":
+            # 大晴天但信心度低，降級處理
+            trend_emoji = "🌤️"
+            trend_status = "晴時多雲"
+            trend_advice = "趨勢樂觀但信心不足，建議維持標準扣款"
+        else:
+            trend_emoji = "🌞"
+            trend_status = "大晴天"
+            trend_advice = "市場樂觀，建議加碼扣款 1.5~2 倍"
     elif change_5d < TREND_BEARISH_THRESHOLD:
         trend_emoji = "⛈️"
         trend_status = "暴風雨"
@@ -381,11 +500,19 @@ def generate_advice(change_1d: float, change_5d: float) -> Dict[str, str]:
         trend_status = "多雲盤整"
         trend_advice = "市場中性，維持標準扣款金額"
     
-    # 進場時機建議（1日模型）
+    # ==========================================================================
+    # 進場時機建議（1日模型 + 信心度調整）
+    # ==========================================================================
     if change_1d > 0:
-        timing_emoji = "✅"
-        timing_status = "綠燈通行"
-        timing_advice = "短期看漲，建議今日進場扣款"
+        if confidence_1d == "低":
+            # 綠燈但信心度低，降級處理
+            timing_emoji = "🟡"
+            timing_status = "黃燈謹慎"
+            timing_advice = "短期微漲但信心不足，建議觀望"
+        else:
+            timing_emoji = "✅"
+            timing_status = "綠燈通行"
+            timing_advice = "短期看漲，建議今日進場扣款"
     else:
         timing_emoji = "🛑"
         timing_status = "紅燈停看聽"
@@ -418,12 +545,26 @@ def get_future_trading_date(start_date: date, trading_days: int) -> date:
 
 
 # =============================================================================
+# 信心度 Emoji
+# =============================================================================
+def get_confidence_emoji(level: str) -> str:
+    """根據信心度等級返回 Emoji"""
+    if level == "高":
+        return "🟢"
+    elif level == "中":
+        return "🟡"
+    else:
+        return "🔴"
+
+
+# =============================================================================
 # 主程式
 # =============================================================================
 def main():
     print("\n" + "=" * 70)
     print("  🤖 TWII 投資顧問機器人 (Trade Advisor)")
     print("  智慧整合多模型，產生動態定期定額操作建議")
+    print("  v2.1 - MC Dropout + 趨勢共振加分機制")
     print("=" * 70)
     
     today = date.today()
@@ -436,7 +577,7 @@ def main():
     print("📊 模型選擇")
     print("-" * 50)
     
-    # 選擇 T+1 模型（短期訊號）
+    # 選擇 T+1 模型
     print(f"\n[T+1 模型] 掃描 {MODELS_DIR_1D}...")
     metadata_1d = select_best_model(MODELS_DIR_1D)
     
@@ -445,7 +586,7 @@ def main():
         print("   請先執行：python twii_model_registry_multivariate.py train ...")
         return
     
-    # 選擇 T+5 模型（波段趨勢）
+    # 選擇 T+5 模型
     print(f"\n[T+5 模型] 掃描 {MODELS_DIR_5D}...")
     metadata_5d = select_best_model(MODELS_DIR_5D)
     
@@ -454,17 +595,19 @@ def main():
         print("   請先執行：python twii_model_registry_5d.py train ...")
         return
     
-    # 取得 lookback 參數
+    # 取得參數
     lookback_1d = metadata_1d.get('lookback', 10)
     lookback_5d = metadata_5d.get('hyperparameters', {}).get('lookback', 
                   metadata_5d.get('lookback', 30))
     
-    # 顯示模型資訊
+    # 取得 RMSE 用於 1D 信心度評估
+    rmse_1d = metadata_1d.get('metrics', {}).get('rmse', 100.0) or 100.0
+    
     r2_1d = metadata_1d.get('metrics', {}).get('r2', 'N/A')
     r2_5d = metadata_5d.get('metrics', {}).get('r2', 'N/A')
     
     print(f"\n✅ 已選擇模型：")
-    print(f"  [T+1] {metadata_1d['train_start']} ~ {metadata_1d['train_end']} (R²: {r2_1d}, Lookback: {lookback_1d})")
+    print(f"  [T+1] {metadata_1d['train_start']} ~ {metadata_1d['train_end']} (R²: {r2_1d}, RMSE: {rmse_1d:.2f})")
     print(f"  [T+5] {metadata_5d['train_start']} ~ {metadata_5d['train_end']} (R²: {r2_5d}, Lookback: {lookback_5d})")
     
     # =========================================================================
@@ -479,7 +622,7 @@ def main():
         print(f"  [T+1] 模型載入成功")
         
         model_5d, scaler_feat_5d, scaler_tgt_5d, _ = load_model_artifacts(MODELS_DIR_5D, metadata_5d)
-        print(f"  [T+5] 模型載入成功")
+        print(f"  [T+5] 模型載入成功（含 Dropout 層）")
     except Exception as e:
         print(f"\n❌ 模型載入失敗：{e}")
         return
@@ -495,7 +638,6 @@ def main():
         df_raw = download_market_data(lookback_1d, lookback_5d)
         df_processed = add_technical_indicators(df_raw)
         
-        # 確保有 Adj Close
         if 'Adj Close' not in df_processed.columns:
             df_processed['Adj Close'] = df_processed['Close']
         
@@ -509,34 +651,64 @@ def main():
         return
     
     # =========================================================================
-    # 4. 執行預測
+    # 4. 執行預測（含信心度評估）
     # =========================================================================
     print("\n" + "-" * 50)
-    print("🔮 模型預測")
+    print("🔮 模型預測 + 信心度評估")
     print("-" * 50)
     
     try:
-        # T+1 預測
+        # ---------------------------------------------------------------------
+        # T+1 預測（標準推論 + RMSE 信心度）
+        # ---------------------------------------------------------------------
         pred_1d = run_inference(model_1d, scaler_feat_1d, scaler_tgt_1d, df_processed, lookback_1d)
         change_1d = (pred_1d - current_price) / current_price
         date_1d = get_future_trading_date(last_date, 1)
         
-        print(f"  [T+1] 預測 {date_1d}：{pred_1d:.2f} ({change_1d:+.2%})")
+        # 評估 1D 原始信心度
+        raw_confidence_1d = evaluate_1d_confidence(pred_1d, current_price, rmse_1d)
         
-        # T+5 預測
-        pred_5d = run_inference(model_5d, scaler_feat_5d, scaler_tgt_5d, df_processed, lookback_5d)
+        # 暫存，稍後在 T+5 預測完成後進行趨勢共振調整
+        print(f"  [T+1] 預測 {date_1d}：{pred_1d:.2f} ({change_1d:+.2%}) | (信心度稍後評估)")
+        
+        # ---------------------------------------------------------------------
+        # T+5 預測（MC Dropout 不確定性評估）
+        # ---------------------------------------------------------------------
+        print(f"  [T+5] 執行 MC Dropout ({MC_DROPOUT_ITERATIONS} 次迭代)...")
+        
+        X_5d = prepare_input_data(df_processed, scaler_feat_5d, lookback_5d)
+        pred_5d, std_5d, confidence_5d = predict_with_uncertainty(
+            model_5d, X_5d, scaler_tgt_5d, MC_DROPOUT_ITERATIONS
+        )
+        
         change_5d = (pred_5d - current_price) / current_price
         date_5d = get_future_trading_date(last_date, 5)
+        conf_emoji_5d = get_confidence_emoji(confidence_5d)
         
-        print(f"  [T+5] 預測 {date_5d}：{pred_5d:.2f} ({change_5d:+.2%})")
+        print(f"  [T+5] 預測 {date_5d}：{pred_5d:.2f} ({change_5d:+.2%}) | 信心度: {conf_emoji_5d} {confidence_5d}")
+        
+        # ---------------------------------------------------------------------
+        # 趨勢共振 (Trend Alignment) 調整 T+1 信心度
+        # ---------------------------------------------------------------------
+        confidence_1d, trend_aligned = apply_trend_alignment(
+            raw_confidence_1d, change_5d, confidence_5d
+        )
+        conf_emoji_1d = get_confidence_emoji(confidence_1d)
+        
+        # 產生加分備註
+        trend_bonus_text = " (順勢加分)" if trend_aligned else ""
+        
+        print(f"  [T+1] 信心度評估：{conf_emoji_1d} {confidence_1d}{trend_bonus_text}")
+        print(f"         風險波動 (Std): ±{std_5d:.2f} 點")
+        
     except Exception as e:
         print(f"\n❌ 預測失敗：{e}")
         return
     
     # =========================================================================
-    # 5. 產生投資建議
+    # 5. 產生投資建議（含信心度調整）
     # =========================================================================
-    advice = generate_advice(change_1d, change_5d)
+    advice = generate_advice(change_1d, change_5d, confidence_1d, confidence_5d)
     
     # =========================================================================
     # 6. 輸出報表
@@ -550,18 +722,19 @@ def main():
 │                        📊 模型履歷                                  │
 ├─────────────────────────────────────────────────────────────────────┤
 │  短期模型 (T+1)：{metadata_1d['train_start']} ~ {metadata_1d['train_end']}                     │
-│                  R² = {r2_1d}  |  Lookback = {lookback_1d} 天                     │
+│                  R² = {r2_1d}  |  RMSE = {rmse_1d:<6.2f}                      │
 ├─────────────────────────────────────────────────────────────────────┤
 │  波段模型 (T+5)：{metadata_5d['train_start']} ~ {metadata_5d['train_end']}                     │
 │                  R² = {r2_5d}  |  Lookback = {lookback_5d} 天                     │
 └─────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        🔮 預測數據                                  │
+│                     🔮 預測數據 (含信心度)                          │
 ├─────────────────────────────────────────────────────────────────────┤
 │  目前價格 ({last_date})              ：{current_price:>10.2f}                     │
-│  T+1 預測 ({date_1d})              ：{pred_1d:>10.2f}  ({change_1d:>+6.2%})           │
-│  T+5 預測 ({date_5d})              ：{pred_5d:>10.2f}  ({change_5d:>+6.2%})           │
+│  T+1 預測 ({date_1d})              ：{pred_1d:>10.2f}  ({change_1d:>+6.2%}) {conf_emoji_1d} {confidence_1d}{trend_bonus_text}  │
+│  T+5 預測 ({date_5d})              ：{pred_5d:>10.2f}  ({change_5d:>+6.2%}) {conf_emoji_5d} {confidence_5d}    │
+│      → 風險波動 (Std)              ：   ±{std_5d:<6.2f} 點                      │
 └─────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -577,10 +750,15 @@ def main():
 └─────────────────────────────────────────────────────────────────────┘
 """)
     
-    # 綜合建議
+    # 綜合建議（考量信心度）
     print("=" * 70)
+    
+    # 高信心度條件下的綜合建議
     if change_5d > TREND_BULLISH_THRESHOLD and change_1d > 0:
-        print("  🎯 綜合建議：市場短期看漲、中期樂觀，建議「加碼進場」")
+        if confidence_1d == "低" or confidence_5d == "低":
+            print("  🎯 綜合建議：趨勢樂觀但信心不足，建議「謹慎觀察」")
+        else:
+            print("  🎯 綜合建議：市場短期看漲、中期樂觀，建議「加碼進場」")
     elif change_5d < TREND_BEARISH_THRESHOLD and change_1d < 0:
         print("  🎯 綜合建議：市場短期看跌、中期悲觀，建議「暫停觀望」")
     elif change_5d > TREND_BULLISH_THRESHOLD and change_1d < 0:
@@ -589,6 +767,7 @@ def main():
         print("  🎯 綜合建議：中期悲觀但短期反彈，建議「逢高減碼」")
     else:
         print("  🎯 綜合建議：市場盤整中，建議「維持標準定期定額」")
+    
     print("=" * 70)
     
     print("\n⚠️  免責聲明：本報告僅供參考，不構成投資建議。投資有風險，請謹慎決策。\n")

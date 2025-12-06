@@ -14,7 +14,7 @@ TWII 多變量模型註冊系統 (Multivariate Model Registry System)
 - MACD_Hist: MACD 柱狀圖（12, 26, 9）
 
 使用方式：
-  訓練：python twii_model_registry_multivariate.py train --start 2020-01-01 --end 2024-01-01
+  訓練：python twii_model_registry_multivariate.py train --start 2020-07-01 --end 2025-12-05
   預測：python twii_model_registry_multivariate.py predict --target_date 2024-12-10
   預測（明天）：python twii_model_registry_multivariate.py predict
 """

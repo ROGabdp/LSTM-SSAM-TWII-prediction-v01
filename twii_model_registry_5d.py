@@ -19,7 +19,7 @@ TWII 5 日預測模型註冊系統 (5-Day Forecast Model Registry System)
 - MACD_Hist: MACD 柱狀圖（12, 26, 9）
 
 使用方式：
-  訓練：python twii_model_registry_5d.py train --start 2020-01-01 --end 2024-01-01
+  訓練：python twii_model_registry_5d.py train --start 2020-01-01 --end 2025-12-05
   預測：python twii_model_registry_5d.py predict
 """
 
