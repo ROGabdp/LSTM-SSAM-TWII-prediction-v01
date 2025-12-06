@@ -7,6 +7,9 @@ __pycache__/
 saved_models/
 *.png
 
+
 # IDE
 .vscode/
 .idea/
+
+saved_models_multivariate/
