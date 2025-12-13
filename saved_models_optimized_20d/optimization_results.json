@@ -1,0 +1,203 @@
+{
+  "results": [
+    {
+      "lookback": 60,
+      "lstm_units": 128,
+      "dropout_rate": 0.3,
+      "batch_size": 8,
+      "val_rmse": 1545.5592503271178,
+      "val_r2": 0.5131141620163311,
+      "epochs_trained": 8
+    },
+    {
+      "lookback": 60,
+      "lstm_units": 128,
+      "dropout_rate": 0.3,
+      "batch_size": 12,
+      "val_rmse": 1498.7953061048559,
+      "val_r2": 0.5421318087536224,
+      "epochs_trained": 8
+    },
+    {
+      "lookback": 60,
+      "lstm_units": 128,
+      "dropout_rate": 0.3,
+      "batch_size": 16,
+      "val_rmse": 1434.3156725294061,
+      "val_r2": 0.580680255295511,
+      "epochs_trained": 10
+    },
+    {
+      "lookback": 60,
+      "lstm_units": 128,
+      "dropout_rate": 0.4,
+      "batch_size": 8,
+      "val_rmse": 1590.2228951717775,
+      "val_r2": 0.4845674647555894,
+      "epochs_trained": 8
+    },
+    {
+      "lookback": 60,
+      "lstm_units": 128,
+      "dropout_rate": 0.4,
+      "batch_size": 12,
+      "val_rmse": 1596.128761046214,
+      "val_r2": 0.48073186653178257,
+      "epochs_trained": 8
+    },
+    {
+      "lookback": 60,
+      "lstm_units": 128,
+      "dropout_rate": 0.4,
+      "batch_size": 16,
+      "val_rmse": 1452.2316119227178,
+      "val_r2": 0.570139442858147,
+      "epochs_trained": 10
+    },
+    {
+      "lookback": 60,
+      "lstm_units": 128,
+      "dropout_rate": 0.5,
+      "batch_size": 8,
+      "val_rmse": 1601.4098041792051,
+      "val_r2": 0.4772900213553727,
+      "epochs_trained": 8
+    },
+    {
+      "lookback": 60,
+      "lstm_units": 128,
+      "dropout_rate": 0.5,
+      "batch_size": 12,
+      "val_rmse": 1766.2261164334093,
+      "val_r2": 0.36415914515264747,
+      "epochs_trained": 7
+    },
+    {
+      "lookback": 60,
+      "lstm_units": 128,
+      "dropout_rate": 0.5,
+      "batch_size": 16,
+      "val_rmse": 1358.9333168993662,
+      "val_r2": 0.62359783079843,
+      "epochs_trained": 15
+    },
+    {
+      "lookback": 60,
+      "lstm_units": 256,
+      "dropout_rate": 0.3,
+      "batch_size": 8,
+      "val_rmse": 1571.845838027902,
+      "val_r2": 0.49641159287464787,
+      "epochs_trained": 8
+    },
+    {
+      "lookback": 60,
+      "lstm_units": 256,
+      "dropout_rate": 0.3,
+      "batch_size": 12,
+      "val_rmse": 1667.9716470442186,
+      "val_r2": 0.43293459513959665,
+      "epochs_trained": 8
+    },
+    {
+      "lookback": 60,
+      "lstm_units": 256,
+      "dropout_rate": 0.3,
+      "batch_size": 16,
+      "val_rmse": 1368.7676181451209,
+      "val_r2": 0.6181302389795365,
+      "epochs_trained": 15
+    },
+    {
+      "lookback": 60,
+      "lstm_units": 256,
+      "dropout_rate": 0.4,
+      "batch_size": 8,
+      "val_rmse": 1632.6312285651475,
+      "val_r2": 0.4567096094192119,
+      "epochs_trained": 8
+    },
+    {
+      "lookback": 60,
+      "lstm_units": 256,
+      "dropout_rate": 0.4,
+      "batch_size": 12,
+      "val_rmse": 1512.736948766145,
+      "val_r2": 0.5335741041559519,
+      "epochs_trained": 8
+    },
+    {
+      "lookback": 60,
+      "lstm_units": 256,
+      "dropout_rate": 0.4,
+      "batch_size": 16,
+      "val_rmse": 1390.7932159892466,
+      "val_r2": 0.605741602695969,
+      "epochs_trained": 15
+    },
+    {
+      "lookback": 60,
+      "lstm_units": 256,
+      "dropout_rate": 0.5,
+      "batch_size": 8,
+      "val_rmse": 1596.2809590598742,
+      "val_r2": 0.48063283273400004,
+      "epochs_trained": 8
+    },
+    {
+      "lookback": 60,
+      "lstm_units": 256,
+      "dropout_rate": 0.5,
+      "batch_size": 12,
+      "val_rmse": 1566.4559675517278,
+      "val_r2": 0.4998592880440814,
+      "epochs_trained": 8
+    },
+    {
+      "lookback": 60,
+      "lstm_units": 256,
+      "dropout_rate": 0.5,
+      "batch_size": 16,
+      "val_rmse": 1484.9261489792864,
+      "val_r2": 0.5505664025174064,
+      "epochs_trained": 10
+    }
+  ],
+  "best_params": {
+    "best_params": {
+      "lookback": 60,
+      "lstm_units": 128,
+      "dropout_rate": 0.5,
+      "batch_size": 16
+    },
+    "validation_metrics": {
+      "rmse": 1358.9333168993662,
+      "r2": 0.62359783079843
+    },
+    "search_space": {
+      "lookback": [
+        60
+      ],
+      "lstm_units": [
+        128,
+        256
+      ],
+      "dropout_rate": [
+        0.3,
+        0.4,
+        0.5
+      ],
+      "batch_size": [
+        8,
+        12,
+        16
+      ]
+    },
+    "total_combinations_tested": 18,
+    "optimization_timestamp": "2025-12-13T09:12:36.472025",
+    "data_range": {
+      "start": "2019-07-01",
+      "end": "2025-12-12"
+    }
+  }
+}

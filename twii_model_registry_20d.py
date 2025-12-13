@@ -1,11 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-TWII 多變量模型註冊系統 (Multivariate Model Registry System)
+TWII 20 日預測模型註冊系統 (20-Day Forecast Model Registry System)
 版本管理與自動模型選擇
 
 功能：
-- train 模式：使用多變量輸入（技術指標）訓練 LSTM-SSAM 模型並儲存成品
-- predict 模式：智慧選擇合適模型進行預測
+- train 模式：使用多變量輸入訓練 LSTM-SSAM 模型，直接預測 20 個交易日後的收盤價
+- predict 模式：智慧選擇合適模型進行 20 日後預測
+
+預測策略：
+- 使用 Direct Strategy（直接預測法），不使用遞迴預測
+- 模型輸入：過去 60 天的特徵資料
+- 模型輸出：第 20 個交易日後的 Adj Close
 
 輸入特徵 (Features)：
 - Adj Close: 調整後收盤價
@@ -14,19 +19,18 @@ TWII 多變量模型註冊系統 (Multivariate Model Registry System)
 - MACD_Hist: MACD 柱狀圖（12, 26, 9）
 
 使用方式：
-  訓練：python twii_model_registry_multivariate.py train --start 2020-07-01 --end 2025-12-05
-  預測：python twii_model_registry_multivariate.py predict --target_date 2024-12-10
-  預測（明天）：python twii_model_registry_multivariate.py predict
+  訓練：python twii_model_registry_20d.py train --start 2020-01-01 --end 2025-12-05
+  預測：python twii_model_registry_20d.py predict
 """
 
 import argparse
 import json
 import pickle
 from datetime import datetime, date, timedelta
-import sys
-import subprocess
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any
+import sys
+import subprocess
 
 import numpy as np
 import pandas as pd
@@ -41,14 +45,17 @@ from tensorflow.keras import layers, Model
 # =============================================================================
 # 設定
 # =============================================================================
-MODELS_DIR = Path(__file__).parent / "saved_models_multivariate"
+MODELS_DIR = Path(__file__).parent / "saved_models_20d"  # 20 日預測專用目錄
 CSV_FILE_PATH = Path(__file__).parent / "twii_data_from_2000_01_01.csv"
 UPDATE_SCRIPT_PATH = Path(__file__).parent / "update_twii_data.py"
 
-LOOKBACK = 10  # 回看天數（論文規格）
-LSTM_UNITS = 50
+# 模型參數 (基於 2025-12-13 Optimizer 最佳化結果)
+LOOKBACK = 60          # 鎖定 60 天
+FORECAST_HORIZON = 20  # 預測未來第 20 個交易日
+LSTM_UNITS = 128       # 小模型 (128) 泛化能力優於 256
+DROPOUT_RATE = 0.5     # 最大正則化 (Maximum Regularization)
 EPOCHS = 50
-BATCH_SIZE = 10
+BATCH_SIZE = 16        # 小批量有助於跳出局部最優
 TRAIN_RATIO = 0.9
 MODEL_STALE_DAYS = 180  # 模型過期警告閾值（天）
 MIN_TRAIN_DAYS = 1460   # 最低訓練天數（4 年 = 4 × 365 = 1460 天）
@@ -58,15 +65,13 @@ KD_PARAMS = (9, 3, 3)  # (K period, K smooth, D smooth)
 MACD_PARAMS = (12, 26, 9)  # (快線, 慢線, 訊號線)
 
 # 技術指標計算所需的最小資料筆數
-# MACD 需要 26 日慢線 + 9 日訊號線 = 至少 35 天
-# KD 需要 9 + 3 + 3 = 15 天
 MIN_INDICATOR_DAYS = 50  # 保守估計，確保指標穩定
 
-# 預設訓練區間參考參數 (基於最佳 R² 表現的訓練區間)
-# 參考區間: 2020-07-01 ~ 2025-12-05
-REFERENCE_START = date(2020, 7, 1)
-REFERENCE_END = date(2025, 12, 5)
-DEFAULT_TRAIN_DAYS = (REFERENCE_END - REFERENCE_START).days  # 1983 天
+# 預設訓練區間參考參數 (待優化器調整)
+# 參考區間: 2019-07-01 ~ 2025-12-13 (T+20 模型最佳測試值)
+REFERENCE_START = date(2019, 7, 1)
+REFERENCE_END = date(2025, 12, 13)
+DEFAULT_TRAIN_DAYS = (REFERENCE_END - REFERENCE_START).days  # 2357 天
 
 # 中文字型設定
 plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei', 'Arial Unicode MS']
@@ -152,7 +157,6 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # -------------------------------------------------------------------------
     # 1. Volume Log 轉換
     # -------------------------------------------------------------------------
-    # 使用 log1p 避免 log(0) 的問題
     df['Volume_Log'] = np.log1p(df['Volume'])
     
     # -------------------------------------------------------------------------
@@ -161,18 +165,11 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # -------------------------------------------------------------------------
     k_period, k_smooth, d_smooth = KD_PARAMS
     
-    # 計算最低價和最高價的滾動窗口
     low_min = df['Low'].rolling(window=k_period).min()
     high_max = df['High'].rolling(window=k_period).max()
     
-    # 計算 Raw Stochastic (%K 原始值)
-    # %K = (Close - Lowest Low) / (Highest High - Lowest Low) * 100
     raw_k = (df['Close'] - low_min) / (high_max - low_min) * 100
-    
-    # 平滑 K 值（使用 SMA）
     df['K'] = raw_k.rolling(window=k_smooth).mean()
-    
-    # D 值是 K 值的 SMA
     df['D'] = df['K'].rolling(window=d_smooth).mean()
     
     # -------------------------------------------------------------------------
@@ -181,21 +178,14 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # -------------------------------------------------------------------------
     fast_period, slow_period, signal_period = MACD_PARAMS
     
-    # 計算 EMA（指數移動平均）
     ema_fast = df['Close'].ewm(span=fast_period, adjust=False).mean()
     ema_slow = df['Close'].ewm(span=slow_period, adjust=False).mean()
-    
-    # MACD 線 = 快線 EMA - 慢線 EMA
     macd_line = ema_fast - ema_slow
-    
-    # 訊號線 = MACD 線的 EMA
     signal_line = macd_line.ewm(span=signal_period, adjust=False).mean()
-    
-    # MACD 柱狀圖 = MACD 線 - 訊號線
     df['MACD_Hist'] = macd_line - signal_line
     
     # -------------------------------------------------------------------------
-    # 4. 移除 NaN（技術指標計算初期會產生空值）
+    # 4. 移除 NaN
     # -------------------------------------------------------------------------
     original_len = len(df)
     df = df.dropna()
@@ -213,25 +203,42 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 # 模型架構
 # =============================================================================
-def build_lstm_ssam_model(time_steps: int = LOOKBACK, n_features: int = 5, lstm_units: int = LSTM_UNITS):
+def build_lstm_ssam_model(
+    time_steps: int = LOOKBACK, 
+    n_features: int = 5, 
+    lstm_units: int = LSTM_UNITS,
+    dropout_rate: float = DROPOUT_RATE
+):
     """
-    建立 LSTM + Self-Attention 混合模型（多變量版本）
+    建立 LSTM + Dropout + Self-Attention 混合模型（20 日預測版本）
+    
+    架構：Input -> LSTM -> Dropout -> Self-Attention -> Flatten -> Dense(1)
     
     Args:
-        time_steps: 回看天數
-        n_features: 輸入特徵數量（預設 5：Adj Close, Volume_Log, K, D, MACD_Hist）
+        time_steps: 回看天數（預設 60）
+        n_features: 輸入特徵數量（預設 5）
         lstm_units: LSTM 隱藏層單元數
+        dropout_rate: Dropout 比率（防止過擬合）
     
     Returns:
         編譯好的 Keras 模型
     """
     inputs = layers.Input(shape=(time_steps, n_features), name='input_layer')
+    
+    # LSTM 層
     lstm_out = layers.LSTM(units=lstm_units, return_sequences=True, name='lstm_layer')(inputs)
-    attention_out = SelfAttention(name='self_attention')(lstm_out)
+    
+    # Dropout 層（防止過擬合）
+    dropout_out = layers.Dropout(rate=dropout_rate, name='dropout_layer')(lstm_out)
+    
+    # Self-Attention 層
+    attention_out = SelfAttention(name='self_attention')(dropout_out)
+    
+    # 輸出層
     flatten_out = layers.Flatten(name='flatten_layer')(attention_out)
     outputs = layers.Dense(units=1, activation='linear', name='output_layer')(flatten_out)
     
-    model = Model(inputs=inputs, outputs=outputs, name='LSTM_SSAM_Multivariate_Model')
+    model = Model(inputs=inputs, outputs=outputs, name='LSTM_SSAM_20Day_Model')
     model.compile(optimizer='adam', loss='mse', metrics=['mae'])
     
     return model
@@ -248,18 +255,15 @@ def run_update_script():
             print(f"[警告] 找不到更新腳本: {UPDATE_SCRIPT_PATH}")
             return
         
-        # 使用目前的 python 直譯器執行腳本
         result = subprocess.run(
             [sys.executable, str(UPDATE_SCRIPT_PATH)],
             capture_output=True,
             text=True,
-            encoding='utf-8'  # 確保正確處理中文輸出
+            encoding='utf-8'
         )
         
         if result.returncode == 0:
             print("[系統] 資料更新程序執行完畢")
-            # 選擇性印出更新腳本的輸出，避免過多雜訊
-            # print(result.stdout)
         else:
             print(f"[錯誤] 更新腳本執行失敗 (Return Code: {result.returncode})")
             print(result.stderr)
@@ -281,14 +285,9 @@ def load_local_csv() -> pd.DataFrame:
     try:
         df = pd.read_csv(CSV_FILE_PATH)
         
-        # 轉換日期
-        # 假設 CSV 日期格式為 YYYY/M/D，pandas 一般能自動解析，或需指定 format
         df['Date'] = pd.to_datetime(df['date'])
         df = df.set_index('Date').sort_index()
         
-        # 重新命名欄位以符合現有程式邏輯 (Title Case)
-        # CSV: date, open, high, low, close, volume
-        # Target: Open, High, Low, Close, Volume
         df = df.rename(columns={
             'open': 'Open',
             'high': 'High',
@@ -297,11 +296,9 @@ def load_local_csv() -> pd.DataFrame:
             'volume': 'Volume'
         })
         
-        # 確保數值型別
         for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
             
-        # 由於使用本地 CSV (無 Adj Close)，將 Close 視為 Adj Close
         if 'Adj Close' not in df.columns:
             df['Adj Close'] = df['Close']
             
@@ -322,11 +319,8 @@ def download_data_by_date_range(start_date: str, end_date: str) -> pd.DataFrame:
     target_start = pd.Timestamp(start_date)
     target_end = pd.Timestamp(end_date)
     
-    # 1. 第一次嘗試讀取
     df = load_local_csv()
     
-    # 檢查是否需要更新
-    # 條件：CSV 不存在 (empty) 或 資料結束日期早於目標結束日期 (且目標結束日期在今天之前或今天)
     today = pd.Timestamp.now().normalize()
     needs_update = False
     
@@ -334,17 +328,14 @@ def download_data_by_date_range(start_date: str, end_date: str) -> pd.DataFrame:
         needs_update = True
     else:
         last_date = df.index[-1]
-        # 如果目標結束日期 > CSV最後日期，且 目標結束日期 <= 今天，代表缺資料
         if target_end > last_date and target_end <= today:
             needs_update = True
     
     if needs_update:
         print(f"[資料獲取] 資料庫資料不足 (最新: {df.index[-1].date() if not df.empty else '無'}), 嘗試更新...")
         run_update_script()
-        # 2. 更新後重新讀取
         df = load_local_csv()
     
-    # 3. 篩選日期範圍
     if not df.empty:
         mask = (df.index >= target_start) & (df.index <= target_end)
         df_filtered = df.loc[mask]
@@ -354,7 +345,6 @@ def download_data_by_date_range(start_date: str, end_date: str) -> pd.DataFrame:
             print(f"[資料獲取] 實際期間：{df_filtered.index[0].strftime('%Y-%m-%d')} ~ {df_filtered.index[-1].strftime('%Y-%m-%d')}")
             return df_filtered
             
-    # 若執行到此仍無法滿足要求
     raise ValueError(
         f"無法取得完整資料區間 ({start_date} ~ {end_date})。\n"
         f"本地資料範圍: {df.index[0].date() if not df.empty else '無'} ~ {df.index[-1].date() if not df.empty else '無'}\n"
@@ -362,30 +352,25 @@ def download_data_by_date_range(start_date: str, end_date: str) -> pd.DataFrame:
     )
 
 
-def download_recent_data(lookback_days: int = 30) -> pd.DataFrame:
+def download_recent_data(lookback_days: int = 60) -> pd.DataFrame:
     """
     取得最近的資料用於預測
     策略：自動嘗試更新至最新 -> 讀取 CSV -> 取最後 N 筆
     """
-    # 計算需要的總資料量：lookback + 技術指標暖機期
     required_days = lookback_days + MIN_INDICATOR_DAYS
     
     print(f"[資料獲取] 準備獲取最近 {required_days} 天的資料...")
     
-    # 總是先嘗試檢查更新，確保預測用的是最新數據
     run_update_script()
     
-    # 讀取資料
     df = load_local_csv()
     
     if df.empty:
         raise ValueError("無法讀取本地資料庫 (CSV 為空)，請檢查 data 目錄")
     
-    # 確認資料量是否足夠
     if len(df) < required_days:
         raise ValueError(f"歷史資料不足，僅有 {len(df)} 筆，需要 {required_days} 筆")
     
-    # 取最後 N 筆
     df_recent = df.tail(required_days).copy()
     
     print(f"[資料獲取] 成功取得 {len(df_recent)} 筆資料 (最新日期: {df_recent.index[-1].date()})")
@@ -398,13 +383,13 @@ def get_feature_columns() -> list:
     return ['Adj Close', 'Volume_Log', 'K', 'D', 'MACD_Hist']
 
 
-def preprocess_for_training(df: pd.DataFrame, lookback: int = LOOKBACK, train_ratio: float = TRAIN_RATIO):
+def preprocess_for_training(df: pd.DataFrame, lookback: int = LOOKBACK, forecast_horizon: int = FORECAST_HORIZON, train_ratio: float = TRAIN_RATIO):
     """
-    訓練用資料預處理（多變量版本，使用雙縮放器策略）
+    訓練用資料預處理（20 日預測版本 - Direct Strategy）
     
-    策略說明：
-    - feature_scaler: 正規化所有輸入特徵（X），用於模型輸入
-    - target_scaler: 專門正規化目標欄位（Adj Close），用於還原預測結果
+    資料對齊邏輯（Direct Strategy）：
+    - 輸入 X：時間點 t-lookback 到 t 的特徵
+    - 目標 y：時間點 t+forecast_horizon 的 Adj Close
     
     Returns:
         X_train, y_train, X_test, y_test, feature_scaler, target_scaler, price_min, price_max, n_features
@@ -412,58 +397,60 @@ def preprocess_for_training(df: pd.DataFrame, lookback: int = LOOKBACK, train_ra
     # 1. 新增技術指標
     df = add_technical_indicators(df)
     
-    # 2. 確保有 Adj Close 欄位（yfinance 預設會包含）
+    # 2. 確保有 Adj Close 欄位
     if 'Adj Close' not in df.columns:
-        # 如果沒有 Adj Close，使用 Close 代替
         df['Adj Close'] = df['Close']
         print("[預處理] 使用 Close 欄位作為 Adj Close")
     
     # 3. 準備特徵矩陣和目標變數
     feature_columns = get_feature_columns()
     
-    # 確認所有欄位都存在
     for col in feature_columns:
         if col not in df.columns:
             raise ValueError(f"缺少必要欄位：{col}")
     
-    # 特徵矩陣 shape: (samples, n_features)
     features = df[feature_columns].values
     n_features = len(feature_columns)
-    
-    # 目標變數 shape: (samples, 1)
     target = df['Adj Close'].values.reshape(-1, 1)
     
     # 4. 建立雙縮放器
     feature_scaler = MinMaxScaler(feature_range=(0, 1))
     target_scaler = MinMaxScaler(feature_range=(0, 1))
     
-    # 擬合並轉換
     scaled_features = feature_scaler.fit_transform(features)
     scaled_target = target_scaler.fit_transform(target)
     
-    # 5. 建立時序資料集
+    # 5. 建立時序資料集（Direct Strategy）
+    # 注意：迴圈結束點需扣除 forecast_horizon，因為最後幾筆沒有未來的答案
     X, y = [], []
-    for i in range(lookback, len(scaled_features)):
-        # X: 過去 lookback 天的所有特徵 shape: (lookback, n_features)
+    max_idx = len(scaled_features) - forecast_horizon  # 可用資料的最後索引
+    
+    for i in range(lookback, max_idx):
+        # X: 時間點 i-lookback 到 i-1 的特徵 (共 lookback 天)
         X.append(scaled_features[i - lookback:i])
-        # y: 目標日的 Adj Close（已縮放）
-        y.append(scaled_target[i, 0])
+        # y: 時間點 i + forecast_horizon - 1 的 Adj Close（即未來第 20 天）
+        # 因為 i 是當前時間點的「下一天」，所以要加 forecast_horizon - 1
+        # 實際上：i 代表的是 lookback 窗口結束後的第一天
+        # 我們要預測的是從這天算起的第 forecast_horizon 天
+        y.append(scaled_target[i + forecast_horizon - 1, 0])
     
     X, y = np.array(X), np.array(y)
+    
+    print(f"[預處理] Direct Strategy 資料對齊完成")
+    print(f"[預處理] X 使用時間點 [t-{lookback}, t)，y 使用時間點 t+{forecast_horizon-1}")
     
     # 6. 分割訓練集與測試集
     train_size = int(len(X) * train_ratio)
     X_train, X_test = X[:train_size], X[train_size:]
     y_train, y_test = y[:train_size], y[train_size:]
     
-    # X 形狀已經是 (samples, time_steps, n_features)，不需要 reshape
-    
-    # 7. 記錄價格範圍（使用原始 Adj Close）
+    # 7. 記錄價格範圍
     price_min = float(df['Adj Close'].min())
     price_max = float(df['Adj Close'].max())
     
     print(f"[預處理] 輸入形狀：{X_train.shape} (samples, time_steps, n_features)")
     print(f"[預處理] 特徵數量：{n_features} ({', '.join(feature_columns)})")
+    print(f"[預處理] 預測目標：未來第 {forecast_horizon} 個交易日")
     print(f"[預處理] 訓練集：{len(X_train)} 筆 | 測試集：{len(X_test)} 筆")
     print(f"[預處理] 價格範圍：{price_min:.2f} ~ {price_max:.2f}")
     
@@ -476,36 +463,25 @@ def preprocess_for_prediction(
     lookback: int = LOOKBACK
 ) -> Tuple[np.ndarray, pd.DataFrame]:
     """
-    預測用資料預處理（多變量版本）
-    
-    Args:
-        df: 原始資料（需包含足夠的歷史資料計算技術指標）
-        feature_scaler: 訓練時擬合的特徵縮放器
-        lookback: 回看天數
+    預測用資料預處理
     
     Returns:
         X: 模型輸入 shape (1, lookback, n_features)
-        df_processed: 處理後的 DataFrame（用於取得最後日期等資訊）
+        df_processed: 處理後的 DataFrame
     """
-    # 1. 計算技術指標
     df_processed = add_technical_indicators(df)
     
-    # 2. 確保有 Adj Close 欄位
     if 'Adj Close' not in df_processed.columns:
         df_processed['Adj Close'] = df_processed['Close']
     
-    # 3. 準備特徵矩陣
     feature_columns = get_feature_columns()
     features = df_processed[feature_columns].values
     
-    # 4. 使用訓練時的縮放器轉換
     scaled_features = feature_scaler.transform(features)
     
-    # 5. 確認資料量足夠
     if len(scaled_features) < lookback:
         raise ValueError(f"資料不足，需要至少 {lookback} 筆資料，目前只有 {len(scaled_features)} 筆")
     
-    # 6. 取最後 lookback 筆資料
     X = scaled_features[-lookback:].reshape(1, lookback, len(feature_columns))
     
     return X, df_processed
@@ -522,31 +498,16 @@ def plot_training_results(
     rmse: float,
     r2: float
 ) -> Path:
-    """
-    繪製訓練結果視覺化圖表
-    
-    Args:
-        y_true: 實際價格
-        y_pred: 預測價格
-        start_date: 訓練起始日期
-        end_date: 訓練結束日期
-        rmse: 均方根誤差
-        r2: R² 分數
-    
-    Returns:
-        圖表儲存路徑
-    """
+    """繪製訓練結果視覺化圖表"""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     
     fig, ax = plt.subplots(figsize=(14, 6))
     
-    # 繪製實際與預測曲線
     x_axis = range(len(y_true))
-    ax.plot(x_axis, y_true, label='Actual', color='blue', linewidth=1.5, alpha=0.8)
-    ax.plot(x_axis, y_pred, label='Predicted', color='red', linewidth=1.5, alpha=0.8)
+    ax.plot(x_axis, y_true, label='Actual (T+20)', color='blue', linewidth=1.5, alpha=0.8)
+    ax.plot(x_axis, y_pred, label='Predicted (T+20)', color='red', linewidth=1.5, alpha=0.8)
     
-    # 標題（含指標）
-    title = f"TWII Multivariate Prediction ({start_date} ~ {end_date}) | R²: {r2:.4f} | RMSE: {rmse:.2f}"
+    title = f"TWII 20-Day Forecast ({start_date} ~ {end_date}) | R²: {r2:.4f} | RMSE: {rmse:.2f}"
     ax.set_title(title, fontsize=14, fontweight='bold')
     
     ax.set_xlabel('測試集樣本索引', fontsize=12)
@@ -554,15 +515,13 @@ def plot_training_results(
     ax.legend(loc='upper left', fontsize=11)
     ax.grid(True, alpha=0.3)
     
-    # 文字注釋方塊（右下角）
-    textstr = f'R² = {r2:.4f}\nRMSE = {rmse:.2f}\n多變量模型'
+    textstr = f'R² = {r2:.4f}\nRMSE = {rmse:.2f}\n20日直接預測'
     props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
     ax.text(0.97, 0.05, textstr, transform=ax.transAxes, fontsize=11,
             verticalalignment='bottom', horizontalalignment='right', bbox=props)
     
     plt.tight_layout()
     
-    # 儲存圖表
     plot_path = MODELS_DIR / f"plot_{start_date}_{end_date}.png"
     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
@@ -576,12 +535,7 @@ def plot_training_results(
 # 模型成品管理
 # =============================================================================
 def get_artifact_paths(start_date: str, end_date: str) -> Tuple[Path, Path, Path, Path]:
-    """
-    取得模型成品路徑（多變量版本需要兩個縮放器檔案）
-    
-    Returns:
-        model_path, feature_scaler_path, target_scaler_path, meta_path
-    """
+    """取得模型成品路徑"""
     model_path = MODELS_DIR / f"model_{start_date}_{end_date}.keras"
     feature_scaler_path = MODELS_DIR / f"feature_scaler_{start_date}_{end_date}.pkl"
     target_scaler_path = MODELS_DIR / f"target_scaler_{start_date}_{end_date}.pkl"
@@ -600,37 +554,38 @@ def save_artifacts(
     n_features: int,
     rmse: float = None,
     r2: float = None,
-    lookback: int = LOOKBACK
+    lookback: int = LOOKBACK,
+    forecast_horizon: int = FORECAST_HORIZON
 ):
-    """儲存模型成品（含雙縮放器與效能指標）"""
+    """儲存模型成品"""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     
     model_path, feature_scaler_path, target_scaler_path, meta_path = get_artifact_paths(start_date, end_date)
     
-    # 儲存模型
     model.save(model_path)
     print(f"[儲存] 模型已儲存至：{model_path}")
     
-    # 儲存特徵縮放器
     with open(feature_scaler_path, 'wb') as f:
         pickle.dump(feature_scaler, f)
     print(f"[儲存] 特徵縮放器已儲存至：{feature_scaler_path}")
     
-    # 儲存目標縮放器
     with open(target_scaler_path, 'wb') as f:
         pickle.dump(target_scaler, f)
     print(f"[儲存] 目標縮放器已儲存至：{target_scaler_path}")
     
-    # 儲存元資料（含效能指標）
     metadata = {
-        "model_type": "multivariate",
+        "model_type": "20day_direct",
         "train_start": start_date,
         "train_end": end_date,
         "lookback": lookback,
+        "forecast_horizon": forecast_horizon,
         "n_features": n_features,
         "feature_columns": get_feature_columns(),
         "price_min": price_min,
         "price_max": price_max,
+        "dropout_rate": DROPOUT_RATE,
+        "lstm_units": LSTM_UNITS,
+        "batch_size": BATCH_SIZE,
         "training_timestamp": datetime.now().isoformat(),
         "technical_indicators": {
             "kd_params": list(KD_PARAMS),
@@ -647,29 +602,20 @@ def save_artifacts(
 
 
 def load_artifacts(start_date: str, end_date: str) -> Tuple[Model, MinMaxScaler, MinMaxScaler, Dict[str, Any]]:
-    """
-    載入模型成品（多變量版本）
-    
-    Returns:
-        model, feature_scaler, target_scaler, metadata
-    """
+    """載入模型成品"""
     model_path, feature_scaler_path, target_scaler_path, meta_path = get_artifact_paths(start_date, end_date)
     
-    # 載入模型（需註冊自訂層）
     model = keras.models.load_model(
         model_path,
         custom_objects={'SelfAttention': SelfAttention}
     )
     
-    # 載入特徵縮放器
     with open(feature_scaler_path, 'rb') as f:
         feature_scaler = pickle.load(f)
     
-    # 載入目標縮放器
     with open(target_scaler_path, 'rb') as f:
         target_scaler = pickle.load(f)
     
-    # 載入元資料
     with open(meta_path, 'r', encoding='utf-8') as f:
         metadata = json.load(f)
     
@@ -679,29 +625,8 @@ def load_artifacts(start_date: str, end_date: str) -> Tuple[Model, MinMaxScaler,
 # =============================================================================
 # 智慧模型選擇
 # =============================================================================
-def parse_date_from_filename(filename: str) -> Tuple[Optional[str], Optional[str]]:
-    """從檔名解析日期"""
-    try:
-        # 格式：meta_YYYY-MM-DD_YYYY-MM-DD.json
-        parts = filename.replace('meta_', '').replace('.json', '').split('_')
-        if len(parts) == 2:
-            return parts[0], parts[1]
-    except Exception:
-        pass
-    return None, None
-
-
 def select_best_model(target_date: date) -> Optional[Dict[str, Any]]:
-    """
-    智慧選擇最適合的模型（含 Tie-Breaker 邏輯）
-    
-    選擇邏輯：
-    1. 掃描所有 meta_*.json 檔案
-    2. 篩選 train_end_date < target_date（避免資料洩漏）
-    3. 排序優先順序：
-       - 主鍵 (Recency): train_end_date 降冪（越新越好）
-       - 次鍵 (Tie-breaker): train_start_date 降冪（較晚開始的模型更專精於近期市場）
-    """
+    """智慧選擇最適合的模型"""
     if not MODELS_DIR.exists():
         print("[搜尋] 模型目錄不存在")
         return None
@@ -721,16 +646,13 @@ def select_best_model(target_date: date) -> Optional[Dict[str, Any]]:
             train_start = datetime.strptime(metadata['train_start'], '%Y-%m-%d').date()
             train_end = datetime.strptime(metadata['train_end'], '%Y-%m-%d').date()
             
-            # 計算訓練天數
             duration_days = (train_end - train_start).days
             model_name = f"model_{metadata['train_start']}_{metadata['train_end']}"
             
-            # 篩選 1：訓練天數必須至少 4 年
             if duration_days < MIN_TRAIN_DAYS:
                 print(f"[略過] 模型 {model_name} 訓練天數 {duration_days} 天不足 4 年 ({MIN_TRAIN_DAYS} 天)")
                 continue
             
-            # 篩選 2：train_end 必須早於 target_date（避免 look-ahead bias）
             if train_end < target_date:
                 candidates.append({
                     'metadata': metadata,
@@ -749,31 +671,15 @@ def select_best_model(target_date: date) -> Optional[Dict[str, Any]]:
         print(f"[搜尋] 沒有符合條件的模型（train_end < {target_date}）")
         return None
     
-    # 排序：主鍵 train_end 降冪，次鍵 r2 降冪，第三鍵 train_start 降冪
-    # train_end 最新 -> R² 最高 -> train_start 最新（更專精）
     candidates.sort(key=lambda x: (x['train_end'], x['r2'], x['train_start']), reverse=True)
     
-    # 輸出候選模型列表
     print(f"\n[搜尋] 找到 {len(candidates)} 個可用模型：")
     for i, c in enumerate(candidates):
         r2_display = f"R²: {c['r2']:.4f}" if c['r2'] else "R²: N/A"
-        status = "Selected (Best Match)" if i == 0 else ""
-        if i > 0:
-            # 判斷為何未被選中
-            if c['train_end'] < candidates[0]['train_end']:
-                status = "Backup (Older end date)"
-            elif c['r2'] < candidates[0]['r2']:
-                status = "Backup (Lower R²)"
-            elif c['train_start'] < candidates[0]['train_start']:
-                status = "Backup (Older start date)"
-            else:
-                status = "Backup"
-        
+        status = "Selected (Best Match)" if i == 0 else "Backup"
         print(f"  {i+1}. {c['model_name']} ({r2_display}) -> {status}")
     
-    # 返回排名第一的模型
     return candidates[0]['metadata']
-
 
 
 def validate_model(metadata: Dict[str, Any], target_date: date, current_price: Optional[float] = None):
@@ -781,11 +687,9 @@ def validate_model(metadata: Dict[str, Any], target_date: date, current_price: O
     train_end = datetime.strptime(metadata['train_end'], '%Y-%m-%d').date()
     gap_days = (target_date - train_end).days
     
-    # 檢查模型是否過期
     if gap_days > MODEL_STALE_DAYS:
         print(f"\n⚠️ 警告：選擇的模型已訓練超過 {MODEL_STALE_DAYS} 天（距今 {gap_days} 天），建議重新訓練。")
     
-    # 檢查價格範圍
     if current_price is not None:
         price_min = metadata.get('price_min', 0)
         price_max = metadata.get('price_max', float('inf'))
@@ -795,17 +699,43 @@ def validate_model(metadata: Dict[str, Any], target_date: date, current_price: O
 
 
 # =============================================================================
+# 計算未來交易日
+# =============================================================================
+def get_future_trading_date(start_date: date, trading_days: int) -> date:
+    """
+    計算未來第 N 個交易日的日期（跳過週末）
+    
+    Args:
+        start_date: 起始日期
+        trading_days: 要前進的交易日數
+    
+    Returns:
+        未來第 N 個交易日的日期
+    """
+    current_date = start_date
+    days_counted = 0
+    
+    while days_counted < trading_days:
+        current_date += timedelta(days=1)
+        # 週一到週五才算交易日
+        if current_date.weekday() < 5:
+            days_counted += 1
+    
+    return current_date
+
+
+# =============================================================================
 # 訓練模式
 # =============================================================================
 def train_mode(args):
     """訓練模式"""
     print("\n" + "=" * 60)
-    print("  TWII 多變量模型註冊系統 - 訓練模式")
+    print("  TWII 20 日預測模型註冊系統 - 訓練模式")
+    print("  (Direct Strategy - 直接預測法)")
     print("=" * 60)
     
     # 處理預設日期邏輯
     if args.start is None or args.end is None:
-        # 使用預設訓練區間：從今天回推 DEFAULT_TRAIN_DAYS 天
         today = date.today()
         end_date = today.strftime('%Y-%m-%d')
         start_date = (today - timedelta(days=DEFAULT_TRAIN_DAYS)).strftime('%Y-%m-%d')
@@ -816,22 +746,21 @@ def train_mode(args):
         end_date = args.end
     
     print(f"\n[設定] 訓練期間：{start_date} ~ {end_date}")
-    print(f"[設定] Lookback: {LOOKBACK} | LSTM Units: {LSTM_UNITS}")
-    print(f"[設定] Epochs: {EPOCHS} | Batch Size: {BATCH_SIZE}")
+    print(f"[設定] Lookback: {LOOKBACK} | Forecast Horizon: {FORECAST_HORIZON}")
+    print(f"[設定] LSTM Units: {LSTM_UNITS} | Epochs: {EPOCHS} | Batch Size: {BATCH_SIZE}")
     print(f"[設定] KD 參數: {KD_PARAMS} | MACD 參數: {MACD_PARAMS}")
     
-    # 設定隨機種子
     np.random.seed(42)
     tf.random.set_seed(42)
     
     # 1. 下載資料
     df = download_data_by_date_range(start_date, end_date)
     
-    # 2. 預處理（含技術指標計算）
+    # 2. 預處理（Direct Strategy）
     X_train, y_train, X_test, y_test, feature_scaler, target_scaler, price_min, price_max, n_features = preprocess_for_training(df)
     
     # 3. 建立模型
-    print("\n[模型] 建立 LSTM-SSAM 多變量模型...")
+    print("\n[模型] 建立 LSTM-SSAM 20 日預測模型...")
     model = build_lstm_ssam_model(time_steps=LOOKBACK, n_features=n_features)
     model.summary()
     
@@ -856,7 +785,6 @@ def train_mode(args):
     print("\n[評估] 計算測試集指標...")
     y_pred_scaled = model.predict(X_test, verbose=0)
     
-    # 使用 target_scaler 還原價格
     y_actual = target_scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
     y_predicted = target_scaler.inverse_transform(y_pred_scaled).flatten()
     
@@ -864,13 +792,14 @@ def train_mode(args):
     r2 = r2_score(y_actual, y_predicted)
     
     print("\n" + "=" * 50)
-    print("📊 模型評估結果 (多變量)")
+    print("📊 模型評估結果 (20 日直接預測)")
     print("=" * 50)
     print(f"  RMSE (均方根誤差)  : {rmse:.2f} 點")
     print(f"  R² Score (決定係數): {r2:.4f}")
+    print(f"  預測目標           : 未來第 {FORECAST_HORIZON} 個交易日")
     print("=" * 50)
     
-    # 6. 儲存成品（含雙縮放器和效能指標）
+    # 6. 儲存成品
     save_artifacts(
         model, feature_scaler, target_scaler, 
         start_date, end_date, 
@@ -881,153 +810,91 @@ def train_mode(args):
     # 7. 繪製訓練結果圖表
     plot_training_results(y_actual, y_predicted, start_date, end_date, rmse, r2)
     
-    print("\n✅ 訓練完成！模型成品已儲存至 saved_models_multivariate/ 目錄")
+    print("\n✅ 訓練完成！模型成品已儲存至 saved_models_20d/ 目錄")
 
 
 # =============================================================================
 # 預測模式
 # =============================================================================
 def predict_mode(args):
-    """預測模式 - 支援多步遞迴預測（多變量版本）"""
+    """預測模式 - 直接預測 20 個交易日後的收盤價"""
     print("\n" + "=" * 60)
-    print("  TWII 多變量模型註冊系統 - 預測模式")
+    print("  TWII 20 日預測模型註冊系統 - 預測模式")
+    print("  (Direct Strategy - 直接預測法)")
     print("=" * 60)
     
-    # 解析目標日期
-    if args.target_date == 'tomorrow':
-        target_date = date.today() + timedelta(days=1)
-        # 跳過週末
-        while target_date.weekday() >= 5:
-            target_date += timedelta(days=1)
-        print(f"\n[設定] 預測目標日期：{target_date}（明日）")
-    else:
-        target_date = datetime.strptime(args.target_date, '%Y-%m-%d').date()
-        print(f"\n[設定] 預測目標日期：{target_date}")
+    # 計算今天和 5 個交易日後的日期
+    today = date.today()
+    target_date = get_future_trading_date(today, FORECAST_HORIZON)
     
-    # 選擇最佳模型
+    print(f"\n[設定] 今日日期：{today}")
+    print(f"[設定] 預測目標：未來第 {FORECAST_HORIZON} 個交易日 ({target_date})")
+    
+    # 選擇最佳模型（基於預測目標日期，而非今天）
+    # 這樣訓練到今天的模型可以用來預測未來 20 天
     print("\n[搜尋] 正在搜尋合適的模型...")
     metadata = select_best_model(target_date)
     
     if metadata is None:
-        print(f"\n❌ 找不到適合目標日期 {target_date} 的歷史模型。")
-        print("   請先訓練一個結束日期早於此日期的模型。")
-        print(f"   範例：python {Path(__file__).name} train --start 2020-01-01 --end {target_date - timedelta(days=1)}")
+        print(f"\n❌ 找不到適合的歷史模型。")
+        print("   請先訓練模型。")
+        print(f"   範例：python {Path(__file__).name} train --start 2020-01-01 --end {today - timedelta(days=1)}")
         return
     
     train_start = metadata['train_start']
     train_end = metadata['train_end']
     lookback = metadata.get('lookback', LOOKBACK)
+    forecast_horizon = metadata.get('forecast_horizon', FORECAST_HORIZON)
     
     print(f"\n✅ 使用模型版本：訓練期間 {train_start} 至 {train_end}")
+    print(f"   模型類型：{forecast_horizon} 日直接預測")
     print(f"   特徵欄位：{metadata.get('feature_columns', get_feature_columns())}")
     
-    # 載入模型成品（包含雙縮放器）
+    # 載入模型成品
     print("\n[載入] 正在載入模型和縮放器...")
     model, feature_scaler, target_scaler, metadata = load_artifacts(train_start, train_end)
     
-    # 下載最近資料（需下載足夠的歷史資料來計算技術指標）
-    df = download_recent_data(lookback_days=lookback + 10)
+    # 下載最近資料
+    df = download_recent_data(lookback_days=lookback + 20)
     
-    # 預處理並計算技術指標
+    # 預處理
     X, df_processed = preprocess_for_prediction(df, feature_scaler, lookback)
     
     current_price = df_processed['Adj Close'].iloc[-1]
     last_data_date = df_processed.index[-1].date()
     
     # 驗證模型
-    validate_model(metadata, target_date, current_price)
+    validate_model(metadata, today, current_price)
     
-    # 計算需要預測多少步
-    days_diff = (target_date - last_data_date).days
-    if days_diff <= 0:
-        print(f"\n⚠️ 目標日期 {target_date} 已有歷史資料，請選擇未來日期。")
-        return
-    
-    # 估算交易日數量（排除週末）
-    trading_days = 0
-    check_date = last_data_date
-    while check_date < target_date:
-        check_date += timedelta(days=1)
-        if check_date.weekday() < 5:  # 週一到週五
-            trading_days += 1
-    
+    # 直接預測（無需遞迴迴圈）
     print(f"\n[預測] 最近資料日期：{last_data_date}")
-    print(f"[預測] 目標日期：{target_date}")
-    print(f"[預測] 需要進行 {trading_days} 步遞迴預測")
+    print(f"[預測] 使用過去 {lookback} 天資料進行單次預測")
     
-    # 準備輸入資料（多變量序列）
-    feature_columns = get_feature_columns()
-    n_features = len(feature_columns)
+    y_pred_scaled = model.predict(X, verbose=0)
+    predicted_price = target_scaler.inverse_transform(y_pred_scaled)[0, 0]
     
-    # 取最後 lookback 筆的縮放後特徵
-    features = df_processed[feature_columns].values
-    scaled_features = feature_scaler.transform(features)
-    current_sequence = scaled_features[-lookback:].tolist()
-    
-    # 多步遞迴預測
-    predictions = []
-    predict_dates = []
-    check_date = last_data_date
-    
-    for step in range(trading_days):
-        # 準備輸入 shape: (1, lookback, n_features)
-        X = np.array(current_sequence[-lookback:]).reshape(1, lookback, n_features)
-        
-        # 預測下一天
-        y_pred_scaled = model.predict(X, verbose=0)
-        predicted_scaled = y_pred_scaled[0, 0]
-        
-        # 更新序列：對於多變量預測，需要用預測值更新 Adj Close 特徵
-        # 其他特徵（Volume_Log, K, D, MACD_Hist）無法預測，使用最後已知值
-        # 這是多步遞迴預測的限制，但對於短期預測影響較小
-        new_row = current_sequence[-1].copy()  # 複製最後一行
-        new_row[0] = predicted_scaled  # 更新第一個特徵（Adj Close 的縮放值）
-        current_sequence.append(new_row)
-        
-        # 記錄預測結果
-        # 使用 target_scaler 還原真實價格
-        predicted_price = target_scaler.inverse_transform([[predicted_scaled]])[0, 0]
-        predictions.append(predicted_price)
-        
-        # 計算對應的交易日
-        check_date += timedelta(days=1)
-        while check_date.weekday() >= 5:  # 跳過週末
-            check_date += timedelta(days=1)
-        predict_dates.append(check_date)
-    
-    # 最終預測價格（目標日期）
-    final_predicted_price = predictions[-1] if predictions else current_price
+    # 計算預測目標日期（從最後資料日開始算 20 個交易日）
+    predicted_date = get_future_trading_date(last_data_date, forecast_horizon)
     
     # 計算漲跌幅
-    price_change = final_predicted_price - current_price
+    price_change = predicted_price - current_price
     price_change_pct = (price_change / current_price) * 100
     trend = "📈 看漲" if price_change > 0 else "📉 看跌"
     
     # 輸出結果
-    print("\n" + "=" * 50)
-    print(f"🔮 TWII 預測結果 (多變量模型) - 目標日期：{target_date}")
-    print("=" * 50)
-    print(f"  最近收盤價 ({last_data_date}) : {current_price:.2f}")
-    print(f"  預測價格   ({target_date})   : {final_predicted_price:.2f}")
-    print(f"  預期變化   : {price_change:+.2f} ({price_change_pct:+.2f}%)")
-    print(f"  趨勢判斷   : {trend}")
-    print("=" * 50)
+    print("\n" + "=" * 55)
+    print(f"🔮 TWII 20 日預測結果")
+    print("=" * 55)
+    print(f"  最近收盤價 ({last_data_date})     : {current_price:.2f}")
+    print(f"  預測價格   ({predicted_date}) : {predicted_price:.2f}")
+    print(f"  預期變化                        : {price_change:+.2f} ({price_change_pct:+.2f}%)")
+    print(f"  趨勢判斷                        : {trend}")
+    print("=" * 55)
+    print(f"  預測策略   : Direct Strategy（直接預測）")
+    print(f"  預測範圍   : 未來第 {forecast_horizon} 個交易日")
     print(f"  使用模型   : {train_start} ~ {train_end}")
-    print(f"  預測步數   : {trading_days} 個交易日")
-    print(f"  輸入特徵   : {n_features} 個")
-    print("=" * 50)
-    
-    # 顯示逐日預測（如果步數不多）
-    if trading_days <= 60:
-        print("\n📊 逐日預測明細：")
-        print("-" * 40)
-        prev_price = current_price
-        for i, (pred_date, pred_price) in enumerate(zip(predict_dates, predictions)):
-            daily_change = pred_price - prev_price
-            daily_pct = (daily_change / prev_price) * 100
-            print(f"  {pred_date} : {pred_price:.2f} ({daily_change:+.2f}, {daily_pct:+.2f}%)")
-            prev_price = pred_price
-        print("-" * 40)
+    print(f"  回看天數   : {lookback} 天")
+    print("=" * 55)
 
 
 # =============================================================================
@@ -1035,18 +902,20 @@ def predict_mode(args):
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description='TWII 多變量模型註冊系統 - 版本管理與自動模型選擇',
+        description='TWII 20 日預測模型註冊系統 - 直接預測法',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 範例：
   訓練模型：
-    python twii_model_registry_multivariate.py train --start 2020-01-01 --end 2024-01-01
+    python twii_model_registry_20d.py train --start 2020-01-01 --end 2024-01-01
   
-  預測明天：
-    python twii_model_registry_multivariate.py predict
-  
-  預測指定日期：
-    python twii_model_registry_multivariate.py predict --target_date 2024-12-10
+  預測 20 個交易日後：
+    python twii_model_registry_20d.py predict
+
+預測策略：
+  - 使用 Direct Strategy（直接預測法）
+  - 模型輸入：過去 60 天的多變量特徵
+  - 模型輸出：第 20 個交易日後的 Adj Close
 
 輸入特徵（多變量）：
   - Adj Close: 調整後收盤價
@@ -1074,13 +943,7 @@ def main():
     )
     
     # predict 子命令
-    predict_parser = subparsers.add_parser('predict', help='預測價格')
-    predict_parser.add_argument(
-        '--target_date',
-        type=str,
-        default='tomorrow',
-        help='預測目標日期 (YYYY-MM-DD)，預設為明天'
-    )
+    predict_parser = subparsers.add_parser('predict', help='預測 20 個交易日後的價格')
     
     args = parser.parse_args()
     

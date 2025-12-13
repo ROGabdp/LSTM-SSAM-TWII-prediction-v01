@@ -1,0 +1,37 @@
+{
+  "model_type": "20day_direct",
+  "train_start": "2019-01-01",
+  "train_end": "2025-12-13",
+  "lookback": 60,
+  "forecast_horizon": 20,
+  "n_features": 5,
+  "feature_columns": [
+    "Adj Close",
+    "Volume_Log",
+    "K",
+    "D",
+    "MACD_Hist"
+  ],
+  "price_min": 8681.34,
+  "price_max": 28400.73,
+  "dropout_rate": 0.5,
+  "lstm_units": 128,
+  "batch_size": 16,
+  "training_timestamp": "2025-12-13T09:20:55.616491",
+  "technical_indicators": {
+    "kd_params": [
+      9,
+      3,
+      3
+    ],
+    "macd_params": [
+      12,
+      26,
+      9
+    ]
+  },
+  "metrics": {
+    "rmse": 1143.07,
+    "r2": 0.7902
+  }
+}

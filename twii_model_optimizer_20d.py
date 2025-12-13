@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-TWII 模型最佳化系統 (Model Optimizer System)
-自動搜索最佳超參數並訓練 5 日預測模型
+TWII T+20 模型最佳化系統 (Model Optimizer System - 20 Day)
+自動搜索最佳超參數並訓練 20 日預測模型
 
 功能：
 - optimize 模式：Grid Search 自動搜索最佳超參數組合
@@ -10,18 +10,18 @@ TWII 模型最佳化系統 (Model Optimizer System)
 
 預測策略：
 - 使用 Direct Strategy（直接預測法）
-- 模型輸出：第 5 個交易日後的 Adj Close
+- 模型輸出：第 20 個交易日後的 Adj Close
 
 搜索參數範圍：
 - Lookback: [30, 60, 90]
-- LSTM Units: [64, 128]
+- LSTM Units: [64, 128, 256]
 - Dropout Rate: [0.2, 0.3, 0.4]
 - Batch Size: [32, 64]
 
 使用方式：
-  最佳化：python twii_model_optimizer.py optimize --start 2020-01-01 --end 2025-12-05
-  訓練：python twii_model_optimizer.py train
-  預測：python twii_model_optimizer.py predict
+  最佳化：python twii_model_optimizer_20d.py optimize --start 2019-07-01 --end 2025-12-12
+  訓練：python twii_model_optimizer_20d.py train
+  預測：python twii_model_optimizer_20d.py predict
 """
 
 import argparse
@@ -31,6 +31,8 @@ import itertools
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List
+import sys
+import subprocess
 
 import numpy as np
 import pandas as pd
@@ -45,25 +47,30 @@ from tensorflow.keras import layers, Model
 # =============================================================================
 # 設定
 # =============================================================================
-MODELS_DIR = Path(__file__).parent / "saved_models_optimized"
+models_dir_name = "saved_models_optimized_20d"
+MODELS_DIR = Path(__file__).parent / models_dir_name
 BEST_PARAMS_FILE = MODELS_DIR / "best_params.json"
+CSV_FILE_PATH = Path(__file__).parent / "twii_data_from_2000_01_01.csv"
+UPDATE_SCRIPT_PATH = Path(__file__).parent / "update_twii_data.py"
 
 # 預測範圍
-FORECAST_HORIZON = 5  # 預測未來第 5 個交易日
+FORECAST_HORIZON = 20  # 預測未來第 20 個交易日
 
 # 預設超參數（當沒有最佳參數時使用）
-DEFAULT_LOOKBACK = 30
-DEFAULT_LSTM_UNITS = 64
-DEFAULT_DROPOUT_RATE = 0.2
-DEFAULT_BATCH_SIZE = 32
+# 針對 T+20 的預設建議值 (基於 2025-12-13 Optimizer 最佳化結果)
+DEFAULT_LOOKBACK = 60      # 鎖定 60 天
+DEFAULT_LSTM_UNITS = 128   # 小模型 (128) 泛化能力優於 256
+DEFAULT_DROPOUT_RATE = 0.5 # 最大正則化 (Maximum Regularization)
+DEFAULT_BATCH_SIZE = 16    # 小批量有助於跳出局部最優
 DEFAULT_EPOCHS = 50
 
-# 最佳化搜索範圍
+# 最佳化搜索範圍 (可根據需求調整)
+# 最佳化搜索範圍 (通用設定)
 SEARCH_SPACE = {
-    'lookback': [30],
-    'lstm_units': [256, 512],
-    'dropout_rate': [0.05],
-    'batch_size': [10, 12]
+    "lookback": [60, 90],
+    "lstm_units": [128, 256],
+    "dropout_rate": [0.3, 0.4, 0.5],
+    "batch_size": [16, 32]
 }
 
 # 最佳化設定
@@ -80,9 +87,9 @@ KD_PARAMS = (9, 3, 3)
 MACD_PARAMS = (12, 26, 9)
 MIN_INDICATOR_DAYS = 50
 
-# 預設訓練區間
-DEFAULT_START_DATE = "2020-01-01"
-DEFAULT_END_DATE = "2025-12-05"
+# 預設訓練區間 (針對 T+20 測試後的最佳區間)
+DEFAULT_START_DATE = "2019-07-01"
+DEFAULT_END_DATE = "2025-12-12"
 
 # 中文字型設定
 plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei', 'Arial Unicode MS']
@@ -237,37 +244,132 @@ def build_lstm_ssam_model(
 # =============================================================================
 # 資料處理
 # =============================================================================
+def run_update_script():
+    """執行 update_twii_data.py 更新資料"""
+    print("[系統] 嘗試呼叫外部腳本更新資料...")
+    try:
+        if not UPDATE_SCRIPT_PATH.exists():
+            print(f"[警告] 找不到更新腳本: {UPDATE_SCRIPT_PATH}")
+            return
+        
+        result = subprocess.run(
+            [sys.executable, str(UPDATE_SCRIPT_PATH)],
+            capture_output=True,
+            text=True,
+            encoding='utf-8'
+        )
+        
+        if result.returncode == 0:
+            print("[系統] 資料更新程序執行完畢")
+        else:
+            print(f"[錯誤] 更新腳本執行失敗 (Return Code: {result.returncode})")
+            print(result.stderr)
+            
+    except Exception as e:
+        print(f"[錯誤] 呼叫更新腳本時發生例外: {e}")
+
+
+def load_local_csv() -> pd.DataFrame:
+    """
+    讀取並格式化本地 CSV 資料
+    """
+    if not CSV_FILE_PATH.exists():
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(CSV_FILE_PATH)
+        
+        df['Date'] = pd.to_datetime(df['date'])
+        df = df.set_index('Date').sort_index()
+        
+        df = df.rename(columns={
+            'open': 'Open',
+            'high': 'High',
+            'low': 'Low',
+            'close': 'Close',
+            'volume': 'Volume'
+        })
+        
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+        if 'Adj Close' not in df.columns:
+            df['Adj Close'] = df['Close']
+            
+        return df[['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']]
+        
+    except Exception as e:
+        print(f"[錯誤] 讀取 CSV 失敗: {e}")
+        return pd.DataFrame()
+
+
 def download_data_by_date_range(start_date: str, end_date: str) -> pd.DataFrame:
-    """下載指定日期範圍的 TWII 資料"""
-    print(f"[資料獲取] 正在下載 ^TWII 資料 ({start_date} ~ {end_date})...")
+    """
+    取得指定日期範圍的 TWII 資料
+    策略：優先讀取本地 CSV -> 若資料不足則自動更新 -> 重試 -> 若仍不足則報錯
+    """
+    print(f"[資料獲取] 正在讀取 ^TWII 資料 ({start_date} ~ {end_date})...")
     
-    ticker = yf.Ticker("^TWII")
-    df = ticker.history(start=start_date, end=end_date)
+    target_start = pd.Timestamp(start_date)
+    target_end = pd.Timestamp(end_date)
+    
+    df = load_local_csv()
+    
+    today = pd.Timestamp.now().normalize()
+    needs_update = False
     
     if df.empty:
-        raise ValueError("無法取得 ^TWII 資料，請檢查網路連線或日期範圍")
+        needs_update = True
+    else:
+        last_date = df.index[-1]
+        if target_end > last_date and target_end <= today:
+            needs_update = True
     
-    print(f"[資料獲取] 成功下載 {len(df)} 筆資料")
-    print(f"[資料獲取] 實際期間：{df.index[0].strftime('%Y-%m-%d')} ~ {df.index[-1].strftime('%Y-%m-%d')}")
+    if needs_update:
+        print(f"[資料獲取] 資料庫資料不足 (最新: {df.index[-1].date() if not df.empty else '無'}), 嘗試更新...")
+        run_update_script()
+        df = load_local_csv()
     
-    return df
+    if not df.empty:
+        mask = (df.index >= target_start) & (df.index <= target_end)
+        df_filtered = df.loc[mask]
+        
+        if not df_filtered.empty:
+            print(f"[資料獲取] 成功取得 {len(df_filtered)} 筆資料")
+            print(f"[資料獲取] 實際期間：{df_filtered.index[0].strftime('%Y-%m-%d')} ~ {df_filtered.index[-1].strftime('%Y-%m-%d')}")
+            return df_filtered
+            
+    raise ValueError(
+        f"無法取得完整資料區間 ({start_date} ~ {end_date})。\n"
+        f"本地資料範圍: {df.index[0].date() if not df.empty else '無'} ~ {df.index[-1].date() if not df.empty else '無'}\n"
+        "請確認日期範圍是否正確，或檢查網路連線與更新腳本。"
+    )
 
 
 def download_recent_data(lookback_days: int = 100) -> pd.DataFrame:
-    """下載最近的資料用於預測"""
+    """
+    取得最近的資料用於預測
+    策略：自動嘗試更新至最新 -> 讀取 CSV -> 取最後 N 筆
+    """
     required_days = lookback_days + MIN_INDICATOR_DAYS
     
-    print(f"[資料獲取] 正在下載最近 {required_days} 天的資料...")
+    print(f"[資料獲取] 準備獲取最近 {required_days} 天的資料...")
     
-    ticker = yf.Ticker("^TWII")
-    df = ticker.history(period=f"{required_days}d")
+    run_update_script()
+    
+    df = load_local_csv()
     
     if df.empty:
-        raise ValueError("無法取得最近的 ^TWII 資料")
+        raise ValueError("無法讀取本地資料庫 (CSV 為空)，請檢查 data 目錄")
     
-    print(f"[資料獲取] 成功下載 {len(df)} 筆資料")
+    if len(df) < required_days:
+        raise ValueError(f"歷史資料不足，僅有 {len(df)} 筆，需要 {required_days} 筆")
     
-    return df
+    df_recent = df.tail(required_days).copy()
+    
+    print(f"[資料獲取] 成功取得 {len(df_recent)} 筆資料 (最新日期: {df_recent.index[-1].date()})")
+    
+    return df_recent
 
 
 def get_feature_columns() -> list:
@@ -582,7 +684,7 @@ def save_artifacts(
     print(f"[儲存] 目標縮放器已儲存至：{target_scaler_path}")
     
     metadata = {
-        "model_type": "optimized_5day_direct",
+        "model_type": "optimized_20day_direct",
         "train_start": start_date,
         "train_end": end_date,
         "forecast_horizon": FORECAST_HORIZON,
@@ -715,10 +817,10 @@ def plot_training_results(
     fig, ax = plt.subplots(figsize=(14, 6))
     
     x_axis = range(len(y_true))
-    ax.plot(x_axis, y_true, label='Actual (T+5)', color='blue', linewidth=1.5, alpha=0.8)
-    ax.plot(x_axis, y_pred, label='Predicted (T+5)', color='red', linewidth=1.5, alpha=0.8)
+    ax.plot(x_axis, y_true, label='Actual (T+20)', color='blue', linewidth=1.5, alpha=0.8)
+    ax.plot(x_axis, y_pred, label='Predicted (T+20)', color='red', linewidth=1.5, alpha=0.8)
     
-    title = f"TWII Optimized 5-Day Forecast ({start_date} ~ {end_date}) | R²: {r2:.4f} | RMSE: {rmse:.2f}"
+    title = f"TWII Optimized 20-Day Forecast ({start_date} ~ {end_date}) | R²: {r2:.4f} | RMSE: {rmse:.2f}"
     ax.set_title(title, fontsize=14, fontweight='bold')
     
     ax.set_xlabel('測試集樣本索引', fontsize=12)
@@ -831,7 +933,7 @@ def train_mode(args):
     price_max = float(df_processed['Adj Close'].max())
     
     print("\n" + "=" * 50)
-    print("📊 模型評估結果 (最佳化 5 日預測)")
+    print("📊 模型評估結果 (最佳化 20 日預測)")
     print("=" * 50)
     print(f"  RMSE (均方根誤差)  : {rmse:.2f} 點")
     print(f"  R² Score (決定係數): {r2:.4f}")
@@ -868,9 +970,9 @@ def predict_mode(args):
     print(f"\n[設定] 今日日期：{today}")
     print(f"[設定] 預測目標：未來第 {FORECAST_HORIZON} 個交易日 ({target_date})")
     
-    # 選擇最佳模型
+    # 選擇最佳模型（基於預測目標日期而非今天）
     print("\n[搜尋] 正在搜尋合適的模型...")
-    metadata = select_best_model(today)
+    metadata = select_best_model(target_date)
     
     if metadata is None:
         print(f"\n❌ 找不到適合的歷史模型。")
@@ -924,7 +1026,7 @@ def predict_mode(args):
     
     # 輸出結果
     print("\n" + "=" * 55)
-    print(f"🔮 TWII 5 日預測結果 (最佳化模型)")
+    print(f"🔮 TWII 20 日預測結果 (最佳化模型)")
     print("=" * 55)
     print(f"  最近收盤價 ({last_data_date})     : {current_price:.2f}")
     print(f"  預測價格   ({predicted_date}) : {predicted_price:.2f}")
@@ -942,24 +1044,24 @@ def predict_mode(args):
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description='TWII 模型最佳化系統 - 自動搜索最佳超參數',
+        description='TWII T+20 模型最佳化系統 - 自動搜索最佳超參數',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 範例：
   超參數搜索：
-    python twii_model_optimizer.py optimize --start 2020-01-01 --end 2025-12-05
+    python twii_model_optimizer_20d.py optimize --start 2019-07-01 --end 2025-12-12
   
   使用最佳參數訓練：
-    python twii_model_optimizer.py train
+    python twii_model_optimizer_20d.py train
   
-  預測 5 個交易日後：
-    python twii_model_optimizer.py predict
+  預測 20 個交易日後：
+    python twii_model_optimizer_20d.py predict
 
 搜索參數範圍：
-  - Lookback: [30, 60, 90]
-  - LSTM Units: [64, 128]
-  - Dropout Rate: [0.2, 0.3, 0.4]
-  - Batch Size: [32, 64]
+  - Lookback: [60, 90]
+  - LSTM Units: [128, 256]
+  - Dropout Rate: [0.3, 0.4, 0.5]
+  - Batch Size: [16, 32]
         """
     )
     
@@ -996,7 +1098,7 @@ def main():
     )
     
     # predict 子命令
-    predict_parser = subparsers.add_parser('predict', help='預測 5 個交易日後的價格')
+    predict_parser = subparsers.add_parser('predict', help='預測 20 個交易日後的價格')
     
     args = parser.parse_args()
     

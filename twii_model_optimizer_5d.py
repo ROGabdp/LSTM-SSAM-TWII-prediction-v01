@@ -1,34 +1,36 @@
 # -*- coding: utf-8 -*-
 """
-TWII 5 日預測模型註冊系統 (5-Day Forecast Model Registry System)
-版本管理與自動模型選擇
+TWII 模型最佳化系統 (Model Optimizer System)
+自動搜索最佳超參數並訓練 5 日預測模型
 
 功能：
-- train 模式：使用多變量輸入訓練 LSTM-SSAM 模型，直接預測 5 個交易日後的收盤價
-- predict 模式：智慧選擇合適模型進行 5 日後預測
+- optimize 模式：Grid Search 自動搜索最佳超參數組合
+- train 模式：使用最佳參數進行全量訓練
+- predict 模式：載入最佳模型進行預測
 
 預測策略：
-- 使用 Direct Strategy（直接預測法），不使用遞迴預測
-- 模型輸入：過去 30 天的特徵資料
+- 使用 Direct Strategy（直接預測法）
 - 模型輸出：第 5 個交易日後的 Adj Close
 
-輸入特徵 (Features)：
-- Adj Close: 調整後收盤價
-- Volume (Log): 成交量（Log 轉換）
-- K, D: KD 指標（9, 3, 3）
-- MACD_Hist: MACD 柱狀圖（12, 26, 9）
+搜索參數範圍：
+- Lookback: [30, 60, 90]
+- LSTM Units: [64, 128]
+- Dropout Rate: [0.2, 0.3, 0.4]
+- Batch Size: [32, 64]
 
 使用方式：
-  訓練：python twii_model_registry_5d.py train --start 2020-01-01 --end 2025-12-05
-  預測：python twii_model_registry_5d.py predict
+  最佳化：python twii_model_optimizer.py optimize --start 2020-01-01 --end 2025-12-05
+  訓練：python twii_model_optimizer.py train
+  預測：python twii_model_optimizer.py predict
 """
 
 import argparse
 import json
 import pickle
+import itertools
 from datetime import datetime, date, timedelta
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 import sys
 import subprocess
 
@@ -45,32 +47,46 @@ from tensorflow.keras import layers, Model
 # =============================================================================
 # 設定
 # =============================================================================
-MODELS_DIR = Path(__file__).parent / "saved_models_5d"  # 5 日預測專用目錄
+MODELS_DIR = Path(__file__).parent / "saved_models_optimized_5d"
+BEST_PARAMS_FILE = MODELS_DIR / "best_params.json"
 CSV_FILE_PATH = Path(__file__).parent / "twii_data_from_2000_01_01.csv"
 UPDATE_SCRIPT_PATH = Path(__file__).parent / "update_twii_data.py"
 
-LOOKBACK = 30  # 回看天數（增加以捕捉更長趨勢）
+# 預測範圍
 FORECAST_HORIZON = 5  # 預測未來第 5 個交易日
-LSTM_UNITS = 256
-DROPOUT_RATE = 0.05  # Dropout 比率（防止過擬合）
-EPOCHS = 50
-BATCH_SIZE = 12
+
+# 預設超參數（當沒有最佳參數時使用）
+DEFAULT_LOOKBACK = 30
+DEFAULT_LSTM_UNITS = 64
+DEFAULT_DROPOUT_RATE = 0.2
+DEFAULT_BATCH_SIZE = 32
+DEFAULT_EPOCHS = 50
+
+# 最佳化搜索範圍
+SEARCH_SPACE = {
+    'lookback': [30],
+    'lstm_units': [256, 512],
+    'dropout_rate': [0.05],
+    'batch_size': [10, 12]
+}
+
+# 最佳化設定
+OPTIMIZE_EPOCHS = 30  # 搜索時使用較少 epochs 加速
+VALIDATION_RATIO = 0.2  # 驗證集比例
+
+# 訓練設定
 TRAIN_RATIO = 0.9
-MODEL_STALE_DAYS = 180  # 模型過期警告閾值（天）
-MIN_TRAIN_DAYS = 1460   # 最低訓練天數（4 年 = 4 × 365 = 1460 天）
+MODEL_STALE_DAYS = 180
+MIN_TRAIN_DAYS = 1460
 
 # 技術指標參數
-KD_PARAMS = (9, 3, 3)  # (K period, K smooth, D smooth)
-MACD_PARAMS = (12, 26, 9)  # (快線, 慢線, 訊號線)
+KD_PARAMS = (9, 3, 3)
+MACD_PARAMS = (12, 26, 9)
+MIN_INDICATOR_DAYS = 50
 
-# 技術指標計算所需的最小資料筆數
-MIN_INDICATOR_DAYS = 50  # 保守估計，確保指標穩定
-
-# 預設訓練區間參考參數 (基於最佳 R² 表現的訓練區間)
-# 參考區間: 2020-01-01 ~ 2025-12-05 (T+5 模型最佳)
-REFERENCE_START = date(2020, 1, 1)
-REFERENCE_END = date(2025, 12, 5)
-DEFAULT_TRAIN_DAYS = (REFERENCE_END - REFERENCE_START).days  # 2165 天
+# 預設訓練區間
+DEFAULT_START_DATE = "2020-01-01"
+DEFAULT_END_DATE = "2025-12-05"
 
 # 中文字型設定
 plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei', 'Arial Unicode MS']
@@ -144,78 +160,57 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     - K: KD 指標的 K 值
     - D: KD 指標的 D 值
     - MACD_Hist: MACD 柱狀圖
-    
-    Args:
-        df: 原始 OHLCV 資料
-    
-    Returns:
-        包含技術指標的 DataFrame（已移除 NaN）
     """
     df = df.copy()
     
-    # -------------------------------------------------------------------------
-    # 1. Volume Log 轉換
-    # -------------------------------------------------------------------------
+    # Volume Log 轉換
     df['Volume_Log'] = np.log1p(df['Volume'])
     
-    # -------------------------------------------------------------------------
-    # 2. KD 指標 (Stochastic Oscillator)
-    # 參數：(K period, K smooth, D smooth) = (9, 3, 3)
-    # -------------------------------------------------------------------------
+    # KD 指標
     k_period, k_smooth, d_smooth = KD_PARAMS
-    
     low_min = df['Low'].rolling(window=k_period).min()
     high_max = df['High'].rolling(window=k_period).max()
-    
     raw_k = (df['Close'] - low_min) / (high_max - low_min) * 100
     df['K'] = raw_k.rolling(window=k_smooth).mean()
     df['D'] = df['K'].rolling(window=d_smooth).mean()
     
-    # -------------------------------------------------------------------------
-    # 3. MACD 指標
-    # 參數：(快線期數, 慢線期數, 訊號線期數) = (12, 26, 9)
-    # -------------------------------------------------------------------------
+    # MACD 指標
     fast_period, slow_period, signal_period = MACD_PARAMS
-    
     ema_fast = df['Close'].ewm(span=fast_period, adjust=False).mean()
     ema_slow = df['Close'].ewm(span=slow_period, adjust=False).mean()
     macd_line = ema_fast - ema_slow
     signal_line = macd_line.ewm(span=signal_period, adjust=False).mean()
     df['MACD_Hist'] = macd_line - signal_line
     
-    # -------------------------------------------------------------------------
-    # 4. 移除 NaN
-    # -------------------------------------------------------------------------
+    # 移除 NaN
     original_len = len(df)
     df = df.dropna()
     removed_len = original_len - len(df)
     
     if removed_len > 0:
-        print(f"[特徵工程] 已移除 {removed_len} 筆含 NaN 的資料（技術指標暖機期）")
-    
-    print(f"[特徵工程] 新增特徵：Volume_Log, K, D, MACD_Hist")
-    print(f"[特徵工程] 最終資料筆數：{len(df)}")
+        print(f"[特徵工程] 已移除 {removed_len} 筆含 NaN 的資料")
     
     return df
 
 
 # =============================================================================
-# 模型架構
+# 模型架構（含 Dropout）
 # =============================================================================
 def build_lstm_ssam_model(
-    time_steps: int = LOOKBACK, 
-    n_features: int = 5, 
-    lstm_units: int = LSTM_UNITS,
-    dropout_rate: float = DROPOUT_RATE
-):
+    time_steps: int,
+    n_features: int,
+    lstm_units: int = DEFAULT_LSTM_UNITS,
+    dropout_rate: float = DEFAULT_DROPOUT_RATE
+) -> Model:
     """
-    建立 LSTM + Dropout + Self-Attention 混合模型（5 日預測版本）
+    建立 LSTM + Dropout + Self-Attention 混合模型
     
-    架構：Input -> LSTM -> Dropout -> Self-Attention -> Flatten -> Dense(1)
+    架構：
+    Input -> LSTM -> Dropout -> Self-Attention -> Flatten -> Dense(1)
     
     Args:
-        time_steps: 回看天數（預設 30）
-        n_features: 輸入特徵數量（預設 5）
+        time_steps: 回看天數（動態調整）
+        n_features: 輸入特徵數量
         lstm_units: LSTM 隱藏層單元數
         dropout_rate: Dropout 比率（防止過擬合）
     
@@ -227,7 +222,7 @@ def build_lstm_ssam_model(
     # LSTM 層
     lstm_out = layers.LSTM(units=lstm_units, return_sequences=True, name='lstm_layer')(inputs)
     
-    # Dropout 層（防止過擬合）
+    # Dropout 層（新增：防止過擬合）
     dropout_out = layers.Dropout(rate=dropout_rate, name='dropout_layer')(lstm_out)
     
     # Self-Attention 層
@@ -237,7 +232,7 @@ def build_lstm_ssam_model(
     flatten_out = layers.Flatten(name='flatten_layer')(attention_out)
     outputs = layers.Dense(units=1, activation='linear', name='output_layer')(flatten_out)
     
-    model = Model(inputs=inputs, outputs=outputs, name='LSTM_SSAM_5Day_Model')
+    model = Model(inputs=inputs, outputs=outputs, name='LSTM_SSAM_Optimized_Model')
     model.compile(optimizer='adam', loss='mse', metrics=['mae'])
     
     return model
@@ -274,9 +269,6 @@ def run_update_script():
 def load_local_csv() -> pd.DataFrame:
     """
     讀取並格式化本地 CSV 資料
-    Returns:
-        DataFrame: 含 columns ['Open', 'High', 'Low', 'Close', 'Volume', 'Adj Close']
-                  且 index 為 DatetimeIndex
     """
     if not CSV_FILE_PATH.exists():
         return pd.DataFrame()
@@ -351,7 +343,7 @@ def download_data_by_date_range(start_date: str, end_date: str) -> pd.DataFrame:
     )
 
 
-def download_recent_data(lookback_days: int = 60) -> pd.DataFrame:
+def download_recent_data(lookback_days: int = 100) -> pd.DataFrame:
     """
     取得最近的資料用於預測
     策略：自動嘗試更新至最新 -> 讀取 CSV -> 取最後 N 筆
@@ -382,152 +374,269 @@ def get_feature_columns() -> list:
     return ['Adj Close', 'Volume_Log', 'K', 'D', 'MACD_Hist']
 
 
-def preprocess_for_training(df: pd.DataFrame, lookback: int = LOOKBACK, forecast_horizon: int = FORECAST_HORIZON, train_ratio: float = TRAIN_RATIO):
+def prepare_data(
+    df: pd.DataFrame,
+    lookback: int,
+    forecast_horizon: int = FORECAST_HORIZON
+) -> Tuple[np.ndarray, np.ndarray, MinMaxScaler, MinMaxScaler, int]:
     """
-    訓練用資料預處理（5 日預測版本 - Direct Strategy）
+    準備訓練/驗證資料（Direct Strategy）
     
-    資料對齊邏輯（Direct Strategy）：
-    - 輸入 X：時間點 t-lookback 到 t 的特徵
-    - 目標 y：時間點 t+forecast_horizon 的 Adj Close
+    資料對齊邏輯：
+    - 輸入 X：時間點 [t-lookback, t) 的特徵
+    - 目標 y：時間點 t+forecast_horizon-1 的 Adj Close
     
     Returns:
-        X_train, y_train, X_test, y_test, feature_scaler, target_scaler, price_min, price_max, n_features
+        X, y, feature_scaler, target_scaler, n_features
     """
-    # 1. 新增技術指標
+    # 新增技術指標
     df = add_technical_indicators(df)
     
-    # 2. 確保有 Adj Close 欄位
+    # 確保有 Adj Close 欄位
     if 'Adj Close' not in df.columns:
         df['Adj Close'] = df['Close']
-        print("[預處理] 使用 Close 欄位作為 Adj Close")
     
-    # 3. 準備特徵矩陣和目標變數
+    # 準備特徵和目標
     feature_columns = get_feature_columns()
-    
-    for col in feature_columns:
-        if col not in df.columns:
-            raise ValueError(f"缺少必要欄位：{col}")
-    
     features = df[feature_columns].values
     n_features = len(feature_columns)
     target = df['Adj Close'].values.reshape(-1, 1)
     
-    # 4. 建立雙縮放器
+    # 建立縮放器
     feature_scaler = MinMaxScaler(feature_range=(0, 1))
     target_scaler = MinMaxScaler(feature_range=(0, 1))
     
     scaled_features = feature_scaler.fit_transform(features)
     scaled_target = target_scaler.fit_transform(target)
     
-    # 5. 建立時序資料集（Direct Strategy）
-    # 注意：迴圈結束點需扣除 forecast_horizon，因為最後幾筆沒有未來的答案
+    # 建立時序資料集（Direct Strategy）
     X, y = [], []
-    max_idx = len(scaled_features) - forecast_horizon  # 可用資料的最後索引
+    max_idx = len(scaled_features) - forecast_horizon
     
     for i in range(lookback, max_idx):
-        # X: 時間點 i-lookback 到 i-1 的特徵 (共 lookback 天)
         X.append(scaled_features[i - lookback:i])
-        # y: 時間點 i + forecast_horizon - 1 的 Adj Close（即未來第 5 天）
-        # 因為 i 是當前時間點的「下一天」，所以要加 forecast_horizon - 1
-        # 實際上：i 代表的是 lookback 窗口結束後的第一天
-        # 我們要預測的是從這天算起的第 forecast_horizon 天
         y.append(scaled_target[i + forecast_horizon - 1, 0])
     
     X, y = np.array(X), np.array(y)
     
-    print(f"[預處理] Direct Strategy 資料對齊完成")
-    print(f"[預處理] X 使用時間點 [t-{lookback}, t)，y 使用時間點 t+{forecast_horizon-1}")
-    
-    # 6. 分割訓練集與測試集
-    train_size = int(len(X) * train_ratio)
-    X_train, X_test = X[:train_size], X[train_size:]
-    y_train, y_test = y[:train_size], y[train_size:]
-    
-    # 7. 記錄價格範圍
-    price_min = float(df['Adj Close'].min())
-    price_max = float(df['Adj Close'].max())
-    
-    print(f"[預處理] 輸入形狀：{X_train.shape} (samples, time_steps, n_features)")
-    print(f"[預處理] 特徵數量：{n_features} ({', '.join(feature_columns)})")
-    print(f"[預處理] 預測目標：未來第 {forecast_horizon} 個交易日")
-    print(f"[預處理] 訓練集：{len(X_train)} 筆 | 測試集：{len(X_test)} 筆")
-    print(f"[預處理] 價格範圍：{price_min:.2f} ~ {price_max:.2f}")
-    
-    return X_train, y_train, X_test, y_test, feature_scaler, target_scaler, price_min, price_max, n_features
+    return X, y, feature_scaler, target_scaler, n_features
 
 
-def preprocess_for_prediction(
-    df: pd.DataFrame, 
-    feature_scaler: MinMaxScaler, 
-    lookback: int = LOOKBACK
-) -> Tuple[np.ndarray, pd.DataFrame]:
+# =============================================================================
+# 超參數最佳化（Grid Search）
+# =============================================================================
+def run_optimization(start_date: str, end_date: str) -> Dict[str, Any]:
     """
-    預測用資料預處理
+    執行 Grid Search 超參數最佳化
+    
+    搜索範圍：
+    - Lookback: [30, 60, 90]
+    - LSTM Units: [64, 128]
+    - Dropout Rate: [0.2, 0.3, 0.4]
+    - Batch Size: [32, 64]
+    
+    使用 Time Series Split：最後 20% 資料作為驗證集
     
     Returns:
-        X: 模型輸入 shape (1, lookback, n_features)
-        df_processed: 處理後的 DataFrame
+        最佳參數字典
     """
-    df_processed = add_technical_indicators(df)
+    print("\n" + "=" * 70)
+    print("  TWII 模型最佳化系統 - Grid Search 超參數搜索")
+    print("=" * 70)
     
-    if 'Adj Close' not in df_processed.columns:
-        df_processed['Adj Close'] = df_processed['Close']
+    # 計算參數組合總數
+    param_combinations = list(itertools.product(
+        SEARCH_SPACE['lookback'],
+        SEARCH_SPACE['lstm_units'],
+        SEARCH_SPACE['dropout_rate'],
+        SEARCH_SPACE['batch_size']
+    ))
+    total_combinations = len(param_combinations)
     
-    feature_columns = get_feature_columns()
-    features = df_processed[feature_columns].values
+    print(f"\n[設定] 搜索參數範圍：")
+    for key, values in SEARCH_SPACE.items():
+        print(f"  - {key}: {values}")
+    print(f"\n[設定] 總共 {total_combinations} 種參數組合")
+    print(f"[設定] 每組合訓練 {OPTIMIZE_EPOCHS} epochs")
+    print(f"[設定] 驗證集比例：{VALIDATION_RATIO * 100:.0f}%")
     
-    scaled_features = feature_scaler.transform(features)
+    # 下載資料
+    df_raw = download_data_by_date_range(start_date, end_date)
     
-    if len(scaled_features) < lookback:
-        raise ValueError(f"資料不足，需要至少 {lookback} 筆資料，目前只有 {len(scaled_features)} 筆")
+    # 記錄所有結果
+    results = []
+    best_rmse = float('inf')
+    best_params = None
     
-    X = scaled_features[-lookback:].reshape(1, lookback, len(feature_columns))
+    # 設定隨機種子
+    np.random.seed(42)
+    tf.random.set_seed(42)
     
-    return X, df_processed
-
-
-# =============================================================================
-# 訓練結果視覺化
-# =============================================================================
-def plot_training_results(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    start_date: str,
-    end_date: str,
-    rmse: float,
-    r2: float
-) -> Path:
-    """繪製訓練結果視覺化圖表"""
+    # ==========================================================================
+    # Grid Search 迴圈
+    # ==========================================================================
+    for idx, (lookback, lstm_units, dropout_rate, batch_size) in enumerate(param_combinations):
+        print(f"\n{'='*60}")
+        print(f"[搜索] 組合 {idx + 1}/{total_combinations}")
+        print(f"  Lookback: {lookback} | LSTM Units: {lstm_units}")
+        print(f"  Dropout: {dropout_rate} | Batch Size: {batch_size}")
+        print("=" * 60)
+        
+        try:
+            # 1. 準備資料（根據當前 lookback 動態調整）
+            X, y, feature_scaler, target_scaler, n_features = prepare_data(
+                df_raw.copy(), lookback=lookback
+            )
+            
+            # 2. 分割訓練集和驗證集（時間序列分割）
+            val_size = int(len(X) * VALIDATION_RATIO)
+            train_size = len(X) - val_size
+            
+            X_train, X_val = X[:train_size], X[train_size:]
+            y_train, y_val = y[:train_size], y[train_size:]
+            
+            print(f"[資料] 訓練集: {len(X_train)} | 驗證集: {len(X_val)}")
+            
+            # 3. 建立模型（根據當前參數動態調整）
+            model = build_lstm_ssam_model(
+                time_steps=lookback,
+                n_features=n_features,
+                lstm_units=lstm_units,
+                dropout_rate=dropout_rate
+            )
+            
+            # 4. 訓練（使用較少 epochs 加速搜索）
+            early_stop = keras.callbacks.EarlyStopping(
+                monitor='val_loss',
+                patience=5,
+                restore_best_weights=True,
+                verbose=0
+            )
+            
+            history = model.fit(
+                X_train, y_train,
+                epochs=OPTIMIZE_EPOCHS,
+                batch_size=batch_size,
+                validation_data=(X_val, y_val),
+                callbacks=[early_stop],
+                verbose=0
+            )
+            
+            # 5. 評估（計算驗證集 RMSE）
+            y_pred_scaled = model.predict(X_val, verbose=0)
+            y_val_actual = target_scaler.inverse_transform(y_val.reshape(-1, 1)).flatten()
+            y_pred_actual = target_scaler.inverse_transform(y_pred_scaled).flatten()
+            
+            rmse = np.sqrt(mean_squared_error(y_val_actual, y_pred_actual))
+            r2 = r2_score(y_val_actual, y_pred_actual)
+            
+            # 記錄結果
+            result = {
+                'lookback': lookback,
+                'lstm_units': lstm_units,
+                'dropout_rate': dropout_rate,
+                'batch_size': batch_size,
+                'val_rmse': float(rmse),
+                'val_r2': float(r2),
+                'epochs_trained': len(history.history['loss'])
+            }
+            results.append(result)
+            
+            print(f"[結果] Val RMSE: {rmse:.2f} | Val R²: {r2:.4f}")
+            
+            # 更新最佳參數
+            if rmse < best_rmse:
+                best_rmse = rmse
+                best_params = result.copy()
+                print(f"  🏆 新的最佳組合！")
+            
+            # 清理 GPU 記憶體
+            keras.backend.clear_session()
+            
+        except Exception as e:
+            print(f"[錯誤] 組合失敗: {e}")
+            continue
+    
+    # ==========================================================================
+    # 輸出最佳化結果
+    # ==========================================================================
+    print("\n" + "=" * 70)
+    print("📊 Grid Search 搜索完成")
+    print("=" * 70)
+    
+    if best_params is None:
+        print("❌ 沒有找到有效的參數組合")
+        return None
+    
+    print(f"\n🏆 最佳參數組合：")
+    print(f"  Lookback (回看天數)  : {best_params['lookback']}")
+    print(f"  LSTM Units          : {best_params['lstm_units']}")
+    print(f"  Dropout Rate        : {best_params['dropout_rate']}")
+    print(f"  Batch Size          : {best_params['batch_size']}")
+    print(f"  驗證集 RMSE         : {best_params['val_rmse']:.2f}")
+    print(f"  驗證集 R²           : {best_params['val_r2']:.4f}")
+    
+    # 儲存最佳參數
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     
-    fig, ax = plt.subplots(figsize=(14, 6))
+    best_params_output = {
+        'best_params': {
+            'lookback': best_params['lookback'],
+            'lstm_units': best_params['lstm_units'],
+            'dropout_rate': best_params['dropout_rate'],
+            'batch_size': best_params['batch_size']
+        },
+        'validation_metrics': {
+            'rmse': best_params['val_rmse'],
+            'r2': best_params['val_r2']
+        },
+        'search_space': SEARCH_SPACE,
+        'total_combinations_tested': len(results),
+        'optimization_timestamp': datetime.now().isoformat(),
+        'data_range': {
+            'start': start_date,
+            'end': end_date
+        }
+    }
     
-    x_axis = range(len(y_true))
-    ax.plot(x_axis, y_true, label='Actual (T+5)', color='blue', linewidth=1.5, alpha=0.8)
-    ax.plot(x_axis, y_pred, label='Predicted (T+5)', color='red', linewidth=1.5, alpha=0.8)
+    with open(BEST_PARAMS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(best_params_output, f, ensure_ascii=False, indent=2)
     
-    title = f"TWII 5-Day Forecast ({start_date} ~ {end_date}) | R²: {r2:.4f} | RMSE: {rmse:.2f}"
-    ax.set_title(title, fontsize=14, fontweight='bold')
+    print(f"\n[儲存] 最佳參數已儲存至：{BEST_PARAMS_FILE}")
     
-    ax.set_xlabel('測試集樣本索引', fontsize=12)
-    ax.set_ylabel('價格 (Price)', fontsize=12)
-    ax.legend(loc='upper left', fontsize=11)
-    ax.grid(True, alpha=0.3)
+    # 儲存完整搜索結果
+    results_file = MODELS_DIR / "optimization_results.json"
+    with open(results_file, 'w', encoding='utf-8') as f:
+        json.dump({
+            'results': results,
+            'best_params': best_params_output
+        }, f, ensure_ascii=False, indent=2)
     
-    textstr = f'R² = {r2:.4f}\nRMSE = {rmse:.2f}\n5日直接預測'
-    props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
-    ax.text(0.97, 0.05, textstr, transform=ax.transAxes, fontsize=11,
-            verticalalignment='bottom', horizontalalignment='right', bbox=props)
+    print(f"[儲存] 完整搜索結果已儲存至：{results_file}")
     
-    plt.tight_layout()
-    
-    plot_path = MODELS_DIR / f"plot_{start_date}_{end_date}.png"
-    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    
-    print(f"[視覺化] 訓練結果圖表已儲存至：{plot_path}")
-    
-    return plot_path
+    return best_params_output
+
+
+# =============================================================================
+# 載入最佳參數
+# =============================================================================
+def load_best_params() -> Dict[str, Any]:
+    """
+    載入最佳參數，如果不存在則返回預設值
+    """
+    if BEST_PARAMS_FILE.exists():
+        with open(BEST_PARAMS_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        print(f"[參數] 已載入最佳參數：{BEST_PARAMS_FILE}")
+        return data['best_params']
+    else:
+        print("[參數] 未找到最佳參數檔案，使用預設值")
+        return {
+            'lookback': DEFAULT_LOOKBACK,
+            'lstm_units': DEFAULT_LSTM_UNITS,
+            'dropout_rate': DEFAULT_DROPOUT_RATE,
+            'batch_size': DEFAULT_BATCH_SIZE
+        }
 
 
 # =============================================================================
@@ -548,15 +657,14 @@ def save_artifacts(
     target_scaler: MinMaxScaler,
     start_date: str,
     end_date: str,
+    hyperparams: Dict[str, Any],
     price_min: float,
     price_max: float,
     n_features: int,
     rmse: float = None,
-    r2: float = None,
-    lookback: int = LOOKBACK,
-    forecast_horizon: int = FORECAST_HORIZON
+    r2: float = None
 ):
-    """儲存模型成品"""
+    """儲存模型成品（含超參數設定）"""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     
     model_path, feature_scaler_path, target_scaler_path, meta_path = get_artifact_paths(start_date, end_date)
@@ -573,19 +681,16 @@ def save_artifacts(
     print(f"[儲存] 目標縮放器已儲存至：{target_scaler_path}")
     
     metadata = {
-        "model_type": "5day_direct",
+        "model_type": "optimized_5day_direct",
         "train_start": start_date,
         "train_end": end_date,
-        "lookback": lookback,
-        "forecast_horizon": forecast_horizon,
+        "forecast_horizon": FORECAST_HORIZON,
         "n_features": n_features,
         "feature_columns": get_feature_columns(),
         "price_min": price_min,
         "price_max": price_max,
-        "dropout_rate": DROPOUT_RATE,
-        "lstm_units": LSTM_UNITS,
-        "batch_size": BATCH_SIZE,
         "training_timestamp": datetime.now().isoformat(),
+        "hyperparameters": hyperparams,
         "technical_indicators": {
             "kd_params": list(KD_PARAMS),
             "macd_params": list(MACD_PARAMS)
@@ -649,7 +754,6 @@ def select_best_model(target_date: date) -> Optional[Dict[str, Any]]:
             model_name = f"model_{metadata['train_start']}_{metadata['train_end']}"
             
             if duration_days < MIN_TRAIN_DAYS:
-                print(f"[略過] 模型 {model_name} 訓練天數 {duration_days} 天不足 4 年 ({MIN_TRAIN_DAYS} 天)")
                 continue
             
             if train_end < target_date:
@@ -657,17 +761,14 @@ def select_best_model(target_date: date) -> Optional[Dict[str, Any]]:
                     'metadata': metadata,
                     'train_start': train_start,
                     'train_end': train_end,
-                    'duration_days': duration_days,
-                    'gap_days': (target_date - train_end).days,
                     'model_name': model_name,
                     'r2': metadata.get('metrics', {}).get('r2', 0.0) or 0.0
                 })
         except Exception as e:
-            print(f"[警告] 無法解析 {meta_file}: {e}")
             continue
     
     if not candidates:
-        print(f"[搜尋] 沒有符合條件的模型（train_end < {target_date}）")
+        print(f"[搜尋] 沒有符合條件的模型")
         return None
     
     candidates.sort(key=lambda x: (x['train_end'], x['r2'], x['train_start']), reverse=True)
@@ -675,48 +776,22 @@ def select_best_model(target_date: date) -> Optional[Dict[str, Any]]:
     print(f"\n[搜尋] 找到 {len(candidates)} 個可用模型：")
     for i, c in enumerate(candidates):
         r2_display = f"R²: {c['r2']:.4f}" if c['r2'] else "R²: N/A"
-        status = "Selected (Best Match)" if i == 0 else "Backup"
+        status = "✅ Selected" if i == 0 else "Backup"
         print(f"  {i+1}. {c['model_name']} ({r2_display}) -> {status}")
     
     return candidates[0]['metadata']
-
-
-def validate_model(metadata: Dict[str, Any], target_date: date, current_price: Optional[float] = None):
-    """驗證模型並發出警告"""
-    train_end = datetime.strptime(metadata['train_end'], '%Y-%m-%d').date()
-    gap_days = (target_date - train_end).days
-    
-    if gap_days > MODEL_STALE_DAYS:
-        print(f"\n⚠️ 警告：選擇的模型已訓練超過 {MODEL_STALE_DAYS} 天（距今 {gap_days} 天），建議重新訓練。")
-    
-    if current_price is not None:
-        price_min = metadata.get('price_min', 0)
-        price_max = metadata.get('price_max', float('inf'))
-        
-        if current_price < price_min or current_price > price_max:
-            print(f"\n⚠️ 警告：當前價格 {current_price:.2f} 超出訓練時的價格範圍 [{price_min:.2f}, {price_max:.2f}]")
 
 
 # =============================================================================
 # 計算未來交易日
 # =============================================================================
 def get_future_trading_date(start_date: date, trading_days: int) -> date:
-    """
-    計算未來第 N 個交易日的日期（跳過週末）
-    
-    Args:
-        start_date: 起始日期
-        trading_days: 要前進的交易日數
-    
-    Returns:
-        未來第 N 個交易日的日期
-    """
+    """計算未來第 N 個交易日的日期"""
     current_date = start_date
     days_counted = 0
     
     while days_counted < trading_days:
         current_date += timedelta(days=1)
-        # 週一到週五才算交易日
         if current_date.weekday() < 5:
             days_counted += 1
     
@@ -724,47 +799,104 @@ def get_future_trading_date(start_date: date, trading_days: int) -> date:
 
 
 # =============================================================================
+# 訓練結果視覺化
+# =============================================================================
+def plot_training_results(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    start_date: str,
+    end_date: str,
+    rmse: float,
+    r2: float,
+    hyperparams: Dict[str, Any]
+) -> Path:
+    """繪製訓練結果視覺化圖表"""
+    fig, ax = plt.subplots(figsize=(14, 6))
+    
+    x_axis = range(len(y_true))
+    ax.plot(x_axis, y_true, label='Actual (T+5)', color='blue', linewidth=1.5, alpha=0.8)
+    ax.plot(x_axis, y_pred, label='Predicted (T+5)', color='red', linewidth=1.5, alpha=0.8)
+    
+    title = f"TWII Optimized 5-Day Forecast ({start_date} ~ {end_date}) | R²: {r2:.4f} | RMSE: {rmse:.2f}"
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    
+    ax.set_xlabel('測試集樣本索引', fontsize=12)
+    ax.set_ylabel('價格 (Price)', fontsize=12)
+    ax.legend(loc='upper left', fontsize=11)
+    ax.grid(True, alpha=0.3)
+    
+    # 超參數資訊
+    textstr = (f"R² = {r2:.4f}\nRMSE = {rmse:.2f}\n"
+               f"Lookback = {hyperparams['lookback']}\n"
+               f"LSTM = {hyperparams['lstm_units']}\n"
+               f"Dropout = {hyperparams['dropout_rate']}")
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
+    ax.text(0.97, 0.05, textstr, transform=ax.transAxes, fontsize=10,
+            verticalalignment='bottom', horizontalalignment='right', bbox=props)
+    
+    plt.tight_layout()
+    
+    plot_path = MODELS_DIR / f"plot_{start_date}_{end_date}.png"
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    
+    print(f"[視覺化] 訓練結果圖表已儲存至：{plot_path}")
+    
+    return plot_path
+
+
+# =============================================================================
 # 訓練模式
 # =============================================================================
 def train_mode(args):
-    """訓練模式"""
+    """使用最佳參數進行全量訓練"""
     print("\n" + "=" * 60)
-    print("  TWII 5 日預測模型註冊系統 - 訓練模式")
-    print("  (Direct Strategy - 直接預測法)")
+    print("  TWII 模型最佳化系統 - 訓練模式")
     print("=" * 60)
     
-    # 處理預設日期邏輯
-    if args.start is None or args.end is None:
-        today = date.today()
-        end_date = today.strftime('%Y-%m-%d')
-        start_date = (today - timedelta(days=DEFAULT_TRAIN_DAYS)).strftime('%Y-%m-%d')
-        print(f"\n[設定] 未指定日期，使用預設訓練區間 ({DEFAULT_TRAIN_DAYS} 天)")
-        print(f"[設定] 參考基準: {REFERENCE_START} ~ {REFERENCE_END}")
-    else:
-        start_date = args.start
-        end_date = args.end
+    start_date = args.start
+    end_date = args.end
+    
+    # 載入最佳參數
+    params = load_best_params()
+    lookback = params['lookback']
+    lstm_units = params['lstm_units']
+    dropout_rate = params['dropout_rate']
+    batch_size = params['batch_size']
     
     print(f"\n[設定] 訓練期間：{start_date} ~ {end_date}")
-    print(f"[設定] Lookback: {LOOKBACK} | Forecast Horizon: {FORECAST_HORIZON}")
-    print(f"[設定] LSTM Units: {LSTM_UNITS} | Epochs: {EPOCHS} | Batch Size: {BATCH_SIZE}")
-    print(f"[設定] KD 參數: {KD_PARAMS} | MACD 參數: {MACD_PARAMS}")
+    print(f"[設定] 使用超參數：")
+    print(f"  Lookback: {lookback} | LSTM Units: {lstm_units}")
+    print(f"  Dropout: {dropout_rate} | Batch Size: {batch_size}")
     
     np.random.seed(42)
     tf.random.set_seed(42)
     
-    # 1. 下載資料
+    # 下載資料
     df = download_data_by_date_range(start_date, end_date)
     
-    # 2. 預處理（Direct Strategy）
-    X_train, y_train, X_test, y_test, feature_scaler, target_scaler, price_min, price_max, n_features = preprocess_for_training(df)
+    # 準備資料
+    X, y, feature_scaler, target_scaler, n_features = prepare_data(df, lookback=lookback)
     
-    # 3. 建立模型
-    print("\n[模型] 建立 LSTM-SSAM 5 日預測模型...")
-    model = build_lstm_ssam_model(time_steps=LOOKBACK, n_features=n_features)
+    # 分割訓練集和測試集
+    train_size = int(len(X) * TRAIN_RATIO)
+    X_train, X_test = X[:train_size], X[train_size:]
+    y_train, y_test = y[:train_size], y[train_size:]
+    
+    print(f"\n[預處理] 訓練集：{len(X_train)} 筆 | 測試集：{len(X_test)} 筆")
+    
+    # 建立模型
+    print("\n[模型] 建立 LSTM-SSAM 最佳化模型...")
+    model = build_lstm_ssam_model(
+        time_steps=lookback,
+        n_features=n_features,
+        lstm_units=lstm_units,
+        dropout_rate=dropout_rate
+    )
     model.summary()
     
-    # 4. 訓練
-    print(f"\n[訓練] 開始訓練...")
+    # 訓練
+    print(f"\n[訓練] 開始訓練（{DEFAULT_EPOCHS} epochs）...")
     early_stop = keras.callbacks.EarlyStopping(
         monitor='val_loss',
         patience=10,
@@ -773,14 +905,14 @@ def train_mode(args):
     
     model.fit(
         X_train, y_train,
-        epochs=EPOCHS,
-        batch_size=BATCH_SIZE,
+        epochs=DEFAULT_EPOCHS,
+        batch_size=batch_size,
         validation_data=(X_test, y_test),
         callbacks=[early_stop],
         verbose=1
     )
     
-    # 5. 評估
+    # 評估
     print("\n[評估] 計算測試集指標...")
     y_pred_scaled = model.predict(X_test, verbose=0)
     
@@ -790,109 +922,117 @@ def train_mode(args):
     rmse = np.sqrt(mean_squared_error(y_actual, y_predicted))
     r2 = r2_score(y_actual, y_predicted)
     
+    # 取得價格範圍
+    df_processed = add_technical_indicators(df)
+    if 'Adj Close' not in df_processed.columns:
+        df_processed['Adj Close'] = df_processed['Close']
+    price_min = float(df_processed['Adj Close'].min())
+    price_max = float(df_processed['Adj Close'].max())
+    
     print("\n" + "=" * 50)
-    print("📊 模型評估結果 (5 日直接預測)")
+    print("📊 模型評估結果 (最佳化 5 日預測)")
     print("=" * 50)
     print(f"  RMSE (均方根誤差)  : {rmse:.2f} 點")
     print(f"  R² Score (決定係數): {r2:.4f}")
-    print(f"  預測目標           : 未來第 {FORECAST_HORIZON} 個交易日")
     print("=" * 50)
     
-    # 6. 儲存成品
+    # 儲存成品
     save_artifacts(
-        model, feature_scaler, target_scaler, 
-        start_date, end_date, 
-        price_min, price_max, n_features,
+        model, feature_scaler, target_scaler,
+        start_date, end_date,
+        hyperparams=params,
+        price_min=price_min, price_max=price_max,
+        n_features=n_features,
         rmse=rmse, r2=r2
     )
     
-    # 7. 繪製訓練結果圖表
-    plot_training_results(y_actual, y_predicted, start_date, end_date, rmse, r2)
+    # 繪製圖表
+    plot_training_results(y_actual, y_predicted, start_date, end_date, rmse, r2, params)
     
-    print("\n✅ 訓練完成！模型成品已儲存至 saved_models_5d/ 目錄")
+    print("\n✅ 訓練完成！模型成品已儲存至 saved_models_optimized/ 目錄")
 
 
 # =============================================================================
 # 預測模式
 # =============================================================================
 def predict_mode(args):
-    """預測模式 - 直接預測 5 個交易日後的收盤價"""
+    """預測模式"""
     print("\n" + "=" * 60)
-    print("  TWII 5 日預測模型註冊系統 - 預測模式")
-    print("  (Direct Strategy - 直接預測法)")
+    print("  TWII 模型最佳化系統 - 預測模式")
     print("=" * 60)
     
-    # 計算今天和 5 個交易日後的日期
     today = date.today()
     target_date = get_future_trading_date(today, FORECAST_HORIZON)
     
     print(f"\n[設定] 今日日期：{today}")
     print(f"[設定] 預測目標：未來第 {FORECAST_HORIZON} 個交易日 ({target_date})")
     
-    # 選擇最佳模型（基於預測目標日期，而非今天）
-    # 這樣訓練到今天的模型可以用來預測未來 5 天
+    # 選擇最佳模型（基於預測目標日期而非今天）
     print("\n[搜尋] 正在搜尋合適的模型...")
     metadata = select_best_model(target_date)
     
     if metadata is None:
         print(f"\n❌ 找不到適合的歷史模型。")
-        print("   請先訓練模型。")
-        print(f"   範例：python {Path(__file__).name} train --start 2020-01-01 --end {today - timedelta(days=1)}")
+        print("   請先執行 optimize 和 train 指令。")
         return
     
     train_start = metadata['train_start']
     train_end = metadata['train_end']
-    lookback = metadata.get('lookback', LOOKBACK)
-    forecast_horizon = metadata.get('forecast_horizon', FORECAST_HORIZON)
+    hyperparams = metadata.get('hyperparameters', load_best_params())
+    lookback = hyperparams.get('lookback', DEFAULT_LOOKBACK)
     
-    print(f"\n✅ 使用模型版本：訓練期間 {train_start} 至 {train_end}")
-    print(f"   模型類型：{forecast_horizon} 日直接預測")
-    print(f"   特徵欄位：{metadata.get('feature_columns', get_feature_columns())}")
+    print(f"\n✅ 使用模型版本：{train_start} ~ {train_end}")
+    print(f"   超參數：Lookback={lookback}, LSTM={hyperparams.get('lstm_units')}")
     
-    # 載入模型成品
+    # 載入模型
     print("\n[載入] 正在載入模型和縮放器...")
     model, feature_scaler, target_scaler, metadata = load_artifacts(train_start, train_end)
     
-    # 下載最近資料
+    # 下載資料
     df = download_recent_data(lookback_days=lookback + 20)
     
     # 預處理
-    X, df_processed = preprocess_for_prediction(df, feature_scaler, lookback)
+    df_processed = add_technical_indicators(df)
+    if 'Adj Close' not in df_processed.columns:
+        df_processed['Adj Close'] = df_processed['Close']
+    
+    feature_columns = get_feature_columns()
+    features = df_processed[feature_columns].values
+    scaled_features = feature_scaler.transform(features)
+    
+    if len(scaled_features) < lookback:
+        raise ValueError(f"資料不足")
+    
+    X = scaled_features[-lookback:].reshape(1, lookback, len(feature_columns))
     
     current_price = df_processed['Adj Close'].iloc[-1]
     last_data_date = df_processed.index[-1].date()
     
-    # 驗證模型
-    validate_model(metadata, today, current_price)
-    
-    # 直接預測（無需遞迴迴圈）
+    # 預測
     print(f"\n[預測] 最近資料日期：{last_data_date}")
-    print(f"[預測] 使用過去 {lookback} 天資料進行單次預測")
+    print(f"[預測] 使用過去 {lookback} 天資料進行預測")
     
     y_pred_scaled = model.predict(X, verbose=0)
     predicted_price = target_scaler.inverse_transform(y_pred_scaled)[0, 0]
     
-    # 計算預測目標日期（從最後資料日開始算 5 個交易日）
-    predicted_date = get_future_trading_date(last_data_date, forecast_horizon)
+    predicted_date = get_future_trading_date(last_data_date, FORECAST_HORIZON)
     
-    # 計算漲跌幅
     price_change = predicted_price - current_price
     price_change_pct = (price_change / current_price) * 100
     trend = "📈 看漲" if price_change > 0 else "📉 看跌"
     
     # 輸出結果
     print("\n" + "=" * 55)
-    print(f"🔮 TWII 5 日預測結果")
+    print(f"🔮 TWII 5 日預測結果 (最佳化模型)")
     print("=" * 55)
     print(f"  最近收盤價 ({last_data_date})     : {current_price:.2f}")
     print(f"  預測價格   ({predicted_date}) : {predicted_price:.2f}")
     print(f"  預期變化                        : {price_change:+.2f} ({price_change_pct:+.2f}%)")
     print(f"  趨勢判斷                        : {trend}")
     print("=" * 55)
-    print(f"  預測策略   : Direct Strategy（直接預測）")
-    print(f"  預測範圍   : 未來第 {forecast_horizon} 個交易日")
-    print(f"  使用模型   : {train_start} ~ {train_end}")
+    print(f"  預測策略   : Direct Strategy（最佳化）")
     print(f"  回看天數   : {lookback} 天")
+    print(f"  使用模型   : {train_start} ~ {train_end}")
     print("=" * 55)
 
 
@@ -901,44 +1041,57 @@ def predict_mode(args):
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description='TWII 5 日預測模型註冊系統 - 直接預測法',
+        description='TWII 模型最佳化系統 - 自動搜索最佳超參數',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 範例：
-  訓練模型：
-    python twii_model_registry_5d.py train --start 2020-01-01 --end 2024-01-01
+  超參數搜索：
+    python twii_model_optimizer.py optimize --start 2020-01-01 --end 2025-12-05
+  
+  使用最佳參數訓練：
+    python twii_model_optimizer.py train
   
   預測 5 個交易日後：
-    python twii_model_registry_5d.py predict
+    python twii_model_optimizer.py predict
 
-預測策略：
-  - 使用 Direct Strategy（直接預測法）
-  - 模型輸入：過去 30 天的多變量特徵
-  - 模型輸出：第 5 個交易日後的 Adj Close
-
-輸入特徵（多變量）：
-  - Adj Close: 調整後收盤價
-  - Volume_Log: 成交量（Log 轉換）
-  - K, D: KD 指標（9, 3, 3）
-  - MACD_Hist: MACD 柱狀圖（12, 26, 9）
+搜索參數範圍：
+  - Lookback: [30, 60, 90]
+  - LSTM Units: [64, 128]
+  - Dropout Rate: [0.2, 0.3, 0.4]
+  - Batch Size: [32, 64]
         """
     )
     
     subparsers = parser.add_subparsers(dest='mode', help='運作模式')
     
+    # optimize 子命令
+    optimize_parser = subparsers.add_parser('optimize', help='執行超參數搜索')
+    optimize_parser.add_argument(
+        '--start',
+        type=str,
+        default=DEFAULT_START_DATE,
+        help=f'訓練資料起始日期 (預設: {DEFAULT_START_DATE})'
+    )
+    optimize_parser.add_argument(
+        '--end',
+        type=str,
+        default=DEFAULT_END_DATE,
+        help=f'訓練資料結束日期 (預設: {DEFAULT_END_DATE})'
+    )
+    
     # train 子命令
-    train_parser = subparsers.add_parser('train', help='訓練新模型')
+    train_parser = subparsers.add_parser('train', help='使用最佳參數訓練')
     train_parser.add_argument(
         '--start',
         type=str,
-        default=None,
-        help='訓練資料起始日期 (YYYY-MM-DD)，預設自動計算'
+        default=DEFAULT_START_DATE,
+        help=f'訓練資料起始日期 (預設: {DEFAULT_START_DATE})'
     )
     train_parser.add_argument(
         '--end',
         type=str,
-        default=None,
-        help='訓練資料結束日期 (YYYY-MM-DD)，預設為今天'
+        default=DEFAULT_END_DATE,
+        help=f'訓練資料結束日期 (預設: {DEFAULT_END_DATE})'
     )
     
     # predict 子命令
@@ -946,7 +1099,9 @@ def main():
     
     args = parser.parse_args()
     
-    if args.mode == 'train':
+    if args.mode == 'optimize':
+        run_optimization(args.start, args.end)
+    elif args.mode == 'train':
         train_mode(args)
     elif args.mode == 'predict':
         predict_mode(args)
