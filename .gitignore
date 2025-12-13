@@ -4,16 +4,11 @@ __pycache__/
 *.pyc
 
 # Artifacts
-saved_models/
-*.png
+# saved_models/
+# *.png
+# saved_models_multivariate/
+# saved_models_5d/
+# saved_models_optimized/
 
-
-# IDE
-.vscode/
-.idea/
-
-
-
-saved_models_multivariate/
-saved_models_5d/
-saved_models_optimized/
+# Local Backups (Do not commit)
+backup_models*/
